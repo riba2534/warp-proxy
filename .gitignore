@@ -1,0 +1,6 @@
+bin/
+*.exe
+*.test
+*.out
+warp-data/
+.DS_Store

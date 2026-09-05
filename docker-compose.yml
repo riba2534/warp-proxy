@@ -1,0 +1,38 @@
+version: "3.8"
+
+services:
+  warp-proxy:
+    image: riba2534/warp-proxy:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: warp-proxy
+    restart: always
+    ports:
+      # SOCKS5 代理端口
+      - "1080:1080"
+      # HTTP 健康检查与指标状态监控端口（可选）
+      - "8080:8080"
+    environment:
+      # 外部暴露监听端口（默认 1080）
+      - WARP_PROXY_PORT=1080
+      # 内部 warp-svc 监听端口（默认 40000）
+      - WARP_SVC_PORT=40000
+      # Cloudflare WARP+ 许可证密钥（可选，普通免费版请留空）
+      - WARP_LICENSE_KEY=
+      # HTTP 健康检查服务端口（设为 0 可关闭 HTTP 探针服务）
+      - HEALTH_PORT=8080
+      # WARP 连接等待超时（默认 60s）
+      - CONNECT_TIMEOUT=60s
+      # 日志级别 (debug, info, warn, error)
+      - LOG_LEVEL=info
+    volumes:
+      # 持久化保存 WARP 注册信息和设备凭证，防止容器重建后重复注册
+      - ./warp-data:/var/lib/cloudflare-warp
+    # 容器原生健康检查配置
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/warp-proxy", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3

@@ -1,0 +1,7 @@
+.git
+.gitignore
+bin/
+warp-data/
+assets/
+*.md
+.dockerignore
