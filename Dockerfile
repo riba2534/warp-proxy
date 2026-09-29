@@ -1,7 +1,7 @@
 # ==========================================
 # 阶段 1: 静态编译 Go 二进制 (支持高速多平台交叉编译)
 # ==========================================
-FROM --platform=$BUILDPLATFORM golang:1-bookworm AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS builder
 
 ENV GOTOOLCHAIN=auto
 WORKDIR /src
@@ -16,7 +16,7 @@ COPY . .
 # 编译静态二进制文件（零外部 CGO 依赖，支持 amd64/arm64 交叉编译）
 ARG TARGETOS
 ARG TARGETARCH
-ARG VERSION=1.0.0
+ARG VERSION=1.1.0
 ARG GIT_COMMIT=docker
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -trimpath \
@@ -27,12 +27,13 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
 # ==========================================
 # 阶段 2: 运行时精简环境
 # ==========================================
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 
-LABEL maintainer="hepengcheng@bytedance.com"
+LABEL maintainer="riba2534@qq.com"
 LABEL description="High-performance SOCKS5 proxy for Cloudflare WARP with transparent L4 forwarding"
 
 ENV DEBIAN_FRONTEND=noninteractive
+ARG WARP_VERSION=2026.7.1377.0
 
 # 安装基础依赖及 Cloudflare 官方客户端源
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -45,13 +46,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ bookworm main" > /etc/apt/sources.list.d/cloudflare-client.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends cloudflare-warp \
+    && apt-get install -y --no-install-recommends cloudflare-warp=${WARP_VERSION} \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # 创建必要的运行目录
 RUN mkdir -p /var/run/dbus /var/lib/cloudflare-warp /var/run/cloudflare-warp \
-    && dbus-uuidgen --ensure=/etc/machine-id
+    && rm -f /etc/machine-id /var/lib/dbus/machine-id
 
 # 从阶段 1 复制已编译好的单一管理二进制
 COPY --from=builder /app/warp-proxy /usr/local/bin/warp-proxy
@@ -64,7 +65,7 @@ VOLUME ["/var/lib/cloudflare-warp"]
 
 # 使用 warp-proxy 原生内置探针执行真实网络健康检查
 # 无需容器内额外调用 curl，直接通过 SOCKS5 代理探测 Cloudflare 官方 trace
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=6s --start-period=90s --retries=3 \
     CMD ["/usr/local/bin/warp-proxy", "-healthcheck"]
 
 # Go 主管程序作为 PID 1 启动

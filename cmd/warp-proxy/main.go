@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/riba2534/warp-proxy/pkg/config"
@@ -44,6 +46,14 @@ func main() {
 	}
 
 	cfg := config.LoadFromEnv()
+	if err := cfg.Validate(); err != nil {
+		log.Fatal(err)
+	}
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(strings.ToUpper(cfg.LogLevel))); err != nil {
+		log.Fatal(err)
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
 	// 健康检查模式
 	if flagHealthcheck {

@@ -13,6 +13,7 @@ import (
 // CLIExecutor 封装调用 warp-cli 命令行工具的执行逻辑
 type CLIExecutor struct {
 	cliPath string
+	timeout time.Duration
 }
 
 // NewCLIExecutor 创建命令行执行器
@@ -34,8 +35,7 @@ func (e *CLIExecutor) runWithFallback(ctx context.Context, primaryArgs, fallback
 	// 检查是否是因为命令行语法不支持（版本差异）
 	lowerOut := strings.ToLower(out)
 	if isCommandSyntaxError(lowerOut) && len(fallbackArgs) > 0 {
-		log.Printf("[WARP-CLI] Primary command 'warp-cli %s' failed (%v), trying fallback 'warp-cli %s'",
-			strings.Join(primaryArgs, " "), err, strings.Join(fallbackArgs, " "))
+		log.Printf("[WARP-CLI] Unsupported command syntax; trying legacy command")
 		return e.run(ctx, fallbackArgs...)
 	}
 
@@ -62,21 +62,35 @@ func isCommandSyntaxError(output string) bool {
 
 // run 执行单个 warp-cli 命令并捕获输出
 func (e *CLIExecutor) run(ctx context.Context, args ...string) (string, error) {
+	timeout := e.timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	// 默认添加 --accept-tos
 	fullArgs := []string{"--accept-tos"}
 	fullArgs = append(fullArgs, args...)
 
 	cmd := exec.CommandContext(ctx, e.cliPath, fullArgs...)
+	cmd.WaitDelay = time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
 	combinedOutput := strings.TrimSpace(stdout.String() + "\n" + stderr.String())
+	safeArgs := append([]string(nil), fullArgs...)
+	for i, arg := range fullArgs {
+		if (arg == "license" || arg == "set-license") && i+1 < len(fullArgs) {
+			combinedOutput = strings.ReplaceAll(combinedOutput, fullArgs[i+1], "[REDACTED]")
+			safeArgs[i+1] = "[REDACTED]"
+		}
+	}
 
 	if err != nil {
 		return combinedOutput, fmt.Errorf("command 'warp-cli %s' failed: %w (output: %s)",
-			strings.Join(fullArgs, " "), err, combinedOutput)
+			strings.Join(safeArgs, " "), err, combinedOutput)
 	}
 
 	return combinedOutput, nil

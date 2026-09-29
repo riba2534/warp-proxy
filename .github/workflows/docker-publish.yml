@@ -26,14 +26,21 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.27.1'
           cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Check known reachable vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
       - name: Run Tests with Race Detector
         run: go test -v -race ./...
 
   docker:
     name: Build & Push Multi-Arch Image
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -59,11 +66,22 @@ jobs:
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/warp-proxy
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=ref,event=branch
+            type=semver,pattern=v{{version}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
+
+      - name: Set binary version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=1.1.0-dev" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build and Push Multi-Arch Docker Image
         uses: docker/build-push-action@v6
@@ -74,5 +92,8 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.value }}
+            GIT_COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

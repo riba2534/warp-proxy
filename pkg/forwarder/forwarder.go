@@ -15,17 +15,19 @@ import (
 // 它将来自客户端的所有原始数据包原汁原味地直通上游 warp-svc，
 // 从而从根本上避免 gost 等应用层代理对 SOCKS5 协议地址类型的篡改。
 type Server struct {
-	listenAddr  string
-	targetAddr  string
-	listener    net.Listener
-	stats       *Stats
-	dialTimeout time.Duration
+	listenAddr     string
+	targetAddr     string
+	listener       net.Listener
+	stats          *Stats
+	dialTimeout    time.Duration
+	maxConnections int
+	clients        int
 
-	mu          sync.Mutex
-	conns       map[net.Conn]struct{}
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
+	mu     sync.Mutex
+	conns  map[net.Conn]struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // closeWriter 定义支持 TCP 半关闭（发送 FIN）的接口
@@ -37,15 +39,19 @@ type closeWriter interface {
 func NewServer(listenAddr, targetAddr string) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		listenAddr:  listenAddr,
-		targetAddr:  targetAddr,
-		stats:       NewStats(),
-		dialTimeout: 5 * time.Second,
-		conns:       make(map[net.Conn]struct{}),
-		ctx:         ctx,
-		cancel:      cancel,
+		listenAddr:     listenAddr,
+		targetAddr:     targetAddr,
+		stats:          NewStats(),
+		dialTimeout:    5 * time.Second,
+		maxConnections: 1024,
+		conns:          make(map[net.Conn]struct{}),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 }
+
+// SetConnectionLimit must be called before Serve.
+func (s *Server) SetConnectionLimit(limit int) { s.maxConnections = limit }
 
 // GetStats 返回当前运行统计信息
 func (s *Server) GetStats() *Stats {
@@ -113,9 +119,24 @@ func (s *Server) Serve() error {
 			}
 		}
 
+		s.mu.Lock()
+		if s.ctx.Err() != nil {
+			s.mu.Unlock()
+			clientConn.Close()
+			return nil
+		}
+		if s.clients >= s.maxConnections {
+			s.mu.Unlock()
+			clientConn.Close()
+			continue
+		}
+		s.clients++
+		s.conns[clientConn] = struct{}{}
 		s.wg.Add(1)
+		s.mu.Unlock()
 		go func(c net.Conn) {
 			defer s.wg.Done()
+			defer func() { s.mu.Lock(); s.clients--; s.mu.Unlock() }()
 			s.handleConn(c)
 		}(clientConn)
 	}
@@ -138,7 +159,7 @@ func (s *Server) handleConn(clientConn net.Conn) {
 		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	s.trackConn(clientConn, true)
+	// Accepted client was registered before admission.
 	defer func() {
 		s.trackConn(clientConn, false)
 		_ = clientConn.Close()
@@ -180,8 +201,13 @@ func (s *Server) handleConn(clientConn net.Conn) {
 	// 客户端 -> 上游 (包含客户端的原始 SOCKS5 握手包，包括 ATYP=0x01 的裸 IP 请求)
 	go func() {
 		defer pipeWg.Done()
-		n, _ := io.Copy(upstreamConn, clientConn)
+		n, err := io.Copy(upstreamConn, clientConn)
 		s.stats.AddBytesClientToUp(n)
+		if err != nil {
+			clientConn.Close()
+			upstreamConn.Close()
+			return
+		}
 		if cw, ok := upstreamConn.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
@@ -190,8 +216,13 @@ func (s *Server) handleConn(clientConn net.Conn) {
 	// 上游 -> 客户端
 	go func() {
 		defer pipeWg.Done()
-		n, _ := io.Copy(clientConn, upstreamConn)
+		n, err := io.Copy(clientConn, upstreamConn)
 		s.stats.AddBytesUpToClient(n)
+		if err != nil {
+			clientConn.Close()
+			upstreamConn.Close()
+			return
+		}
 		if cw, ok := clientConn.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
@@ -203,7 +234,9 @@ func (s *Server) handleConn(clientConn net.Conn) {
 func (s *Server) trackConn(c net.Conn, add bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if add {
+	if add && s.ctx.Err() != nil {
+		_ = c.Close()
+	} else if add {
 		s.conns[c] = struct{}{}
 	} else {
 		delete(s.conns, c)

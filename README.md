@@ -85,7 +85,7 @@ version: "3.8"
 
 services:
   warp-proxy:
-    image: riba2534/warp-proxy:latest
+    image: riba2534/warp-proxy:v1.1.0
     container_name: warp-proxy
     restart: always
     cap_add:
@@ -94,9 +94,9 @@ services:
       - /dev/net/tun
     ports:
       # SOCKS5 代理端口
-      - "1080:1080"
+      - "127.0.0.1:1080:1080"
       # HTTP 监控与健康检查端口（可选）
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       - WARP_PROXY_PORT=1080
       - WARP_SVC_PORT=40000
@@ -110,8 +110,8 @@ services:
     healthcheck:
       test: ["CMD", "/usr/local/bin/warp-proxy", "-healthcheck"]
       interval: 30s
-      timeout: 5s
-      start_period: 15s
+      timeout: 6s
+      start_period: 90s
       retries: 3
 ```
 
@@ -129,10 +129,10 @@ docker run -d \
   --restart always \
   --cap-add=NET_ADMIN \
   --device /dev/net/tun \
-  -p 1080:1080 \
-  -p 8080:8080 \
+  -p 127.0.0.1:1080:1080 \
+  -p 127.0.0.1:8080:8080 \
   -v ./warp-data:/var/lib/cloudflare-warp \
-  riba2534/warp-proxy:latest
+  riba2534/warp-proxy:v1.1.0
 ```
 
 ### 3. 连接与使用示例
@@ -163,7 +163,7 @@ export ALL_PROXY=socks5://127.0.0.1:1080
 | `HEALTH_PORT` | `8080` | HTTP 健康检查与监控服务的端口（设为 `0` 时禁用） |
 | `DISABLE_HEALTH_SERVER` | `false` | 设置为 `true` 时彻底停用 HTTP 监控服务 |
 | `CONNECT_TIMEOUT` | `60s` | 等待 WARP 隧道建连的最长超时时间 |
-| `HEALTHCHECK_TIMEOUT` | `10s` | 每次执行网络连通性探测的超时阈值 |
+| `HEALTHCHECK_TIMEOUT` | `4s` | 每次执行网络连通性探测的超时阈值 |
 | `LOG_LEVEL` | `info` | 日志输出级别 (`debug`, `info`, `warn`, `error`) |
 
 ## 监控与健康检查
@@ -202,7 +202,7 @@ curl -s http://127.0.0.1:8080/status | jq .
       "tls": "TLSv1.3",
       "warp": "on"
     },
-    "check_duration_ms": 207894445
+    "check_duration_ms": 207
   },
   "forwarder_stats": {
     "uptime_seconds": 360,
@@ -241,3 +241,56 @@ docker build -t warp-proxy:latest .
 ## 开源许可证
 
 本项目采用 [MIT 许可证](LICENSE) 开源。
+
+
+## v1.1.0: bounded failures and recovery
+
+The TCP forwarder remains transparent and preserves normal half-close behavior.
+Abnormal I/O errors close both sockets, and `MAX_CONNECTIONS` limits admitted
+connections (default 1024). Byte counters are updated when each copy completes;
+they are not an instantaneous throughput meter.
+
+The supervisor now reaps child processes. If WARP or its managed D-Bus exits,
+PID 1 exits with an error so Docker can restart it. A background WARP trace probe
+also exits the container after sustained failures. It waits for startup grace,
+then counts **consecutive** failed probes; a success resets the count. Docker's
+`unhealthy` label alone does not restart a container. Recovery preserves the
+mounted registration directory and never deletes credentials on transient errors.
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| `CONNECT_TIMEOUT` | `60s` | Total initialization budget, including CLI calls |
+| `HEALTHCHECK_TIMEOUT` | `4s` | Overall probe budget, divided among fallback targets |
+| `RECOVERY_GRACE` | `60s` | Delay after startup before background monitoring |
+| `RECOVERY_INTERVAL` | `30s` | Interval between background probes |
+| `RECOVERY_FAILURES` | `3` | Consecutive failures before exit; `0` disables recovery probes |
+| `MAX_CONNECTIONS` | `1024` | Maximum admitted TCP client connections |
+| `LOG_LEVEL` | `info` | Supervisor/Go wrapper level; does not configure official WARP daemon logs |
+
+A slow or blocked SOCKS handshake is cancelled and closed within the probe
+budget. Concurrent HTTP health requests share one in-flight probe; its result
+is cached for five seconds. `check_duration_ms` now actually uses milliseconds
+(previous versions incorrectly emitted nanoseconds). Treat this as a monitoring
+unit correction when upgrading dashboards.
+
+The sample publishes ports on loopback. For a sibling Mihomo container, use a
+private Docker network and avoid publishing either port. Keep the persistent
+`/var/lib/cloudflare-warp` volume when upgrading. Docker log rotation in the
+sample bounds stored daemon output.
+
+Builds pin the Go and Debian base image digests and the official WARP package
+(`2026.7.1377.0`). Tags publish `v1.1.0`, `1.1.0`, minor aliases and `latest`;
+main branch pushes run validation only; version tags build and publish images.
+Manual branch builds can publish `main` and the commit tag without moving `latest`.
+The binary includes the release version and source commit. Deploy the version
+or digest for reproducibility. Updating WARP itself should be tested separately
+from changes to the wrapper.
+
+### Regression tests
+
+`go test -race ./...` covers hung SOCKS handshakes, CLI deadline propagation,
+TCP reset cleanup, normal half-close, child exit/reaping, recovery thresholds,
+license redaction and JSON duration units. For a Linux canary, also verify real
+HTTPS traffic through the native WARP proxy and the exposed proxy, and confirm
+Docker recovers from an intentionally terminated WARP child. A short canary
+cannot establish long-term stability of Cloudflare's tunnel or client.

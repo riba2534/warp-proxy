@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -27,6 +28,15 @@ type Result struct {
 	CheckDuration time.Duration     `json:"check_duration_ms"`
 }
 
+// MarshalJSON keeps the public duration field in milliseconds, not nanoseconds.
+func (r Result) MarshalJSON() ([]byte, error) {
+	type alias Result
+	return json.Marshal(struct {
+		*alias
+		CheckDurationMS int64 `json:"check_duration_ms"`
+	}{alias: (*alias)(&r), CheckDurationMS: r.CheckDuration.Milliseconds()})
+}
+
 // Checker 执行通过 SOCKS5 代理的真实网络连通性探测
 type Checker struct {
 	proxyAddr string
@@ -36,6 +46,7 @@ type Checker struct {
 	cachedRes   *Result
 	cachedTime  time.Time
 	cacheMaxAge time.Duration
+	inFlight    chan struct{}
 }
 
 // NewChecker 创建健康检查器
@@ -49,22 +60,41 @@ func NewChecker(proxyAddr string, timeout time.Duration) *Checker {
 
 // Check 执行健康检查，支持短时间结果缓存
 func (c *Checker) Check(ctx context.Context) *Result {
-	c.cacheMu.RLock()
-	if c.cachedRes != nil && time.Since(c.cachedTime) < c.cacheMaxAge {
-		res := *c.cachedRes
-		c.cacheMu.RUnlock()
-		return &res
+	for {
+		c.cacheMu.Lock()
+		if c.cachedRes != nil && time.Since(c.cachedTime) < c.cacheMaxAge {
+			res := cloneResult(c.cachedRes)
+			c.cacheMu.Unlock()
+			return res
+		}
+		if pending := c.inFlight; pending != nil {
+			c.cacheMu.Unlock()
+			select {
+			case <-pending:
+				continue
+			case <-ctx.Done():
+				return &Result{Error: ctx.Err().Error(), TraceWarp: "unknown"}
+			}
+		}
+		c.inFlight = make(chan struct{})
+		c.cacheMu.Unlock()
+		res := c.doCheck(ctx)
+		c.cacheMu.Lock()
+		c.cachedRes, c.cachedTime = res, time.Now()
+		close(c.inFlight)
+		c.inFlight = nil
+		c.cacheMu.Unlock()
+		return cloneResult(res)
 	}
-	c.cacheMu.RUnlock()
+}
 
-	res := c.doCheck(ctx)
-
-	c.cacheMu.Lock()
-	c.cachedRes = res
-	c.cachedTime = time.Now()
-	c.cacheMu.Unlock()
-
-	return res
+func cloneResult(in *Result) *Result {
+	out := *in
+	out.TraceRaw = make(map[string]string, len(in.TraceRaw))
+	for k, v := range in.TraceRaw {
+		out.TraceRaw[k] = v
+	}
+	return &out
 }
 
 // doCheck 实际建立 SOCKS5 拨号并发起 HTTP 请求
@@ -106,10 +136,16 @@ func (c *Checker) doCheck(ctx context.Context) *Result {
 	}
 
 	var lastErr error
-	for _, target := range targets {
+	for index, target := range targets {
+		if ctxTimeout.Err() != nil {
+			break
+		}
+		remaining, _ := ctxTimeout.Deadline()
+		budget := time.Until(remaining) / time.Duration(len(targets)-index)
+		attemptCtx, attemptCancel := context.WithTimeout(ctxTimeout, budget)
 		tr := &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return dialer.Dial(network, addr)
+				return dialer.(proxy.ContextDialer).DialContext(attemptCtx, network, addr)
 			},
 			TLSClientConfig: &tls.Config{
 				ServerName: target.serverName,
@@ -124,9 +160,10 @@ func (c *Checker) doCheck(ctx context.Context) *Result {
 			Timeout:   c.timeout,
 		}
 
-		req, err := http.NewRequestWithContext(ctxTimeout, "GET", target.url, nil)
+		req, err := http.NewRequestWithContext(attemptCtx, "GET", target.url, nil)
 		if err != nil {
 			lastErr = err
+			attemptCancel()
 			continue
 		}
 		req.Header.Set("User-Agent", "warp-proxy-healthcheck/1.0")
@@ -134,15 +171,20 @@ func (c *Checker) doCheck(ctx context.Context) *Result {
 		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err
+			attemptCancel()
 			continue
 		}
 
 		if resp.StatusCode != http.StatusOK {
 			_ = resp.Body.Close()
+			attemptCancel()
 			lastErr = fmt.Errorf("HTTP status %d", resp.StatusCode)
 			continue
 		}
 
+		// Each fallback target must have its own trace state.
+		res.TraceWarp = "unknown"
+		res.TraceRaw = make(map[string]string)
 		// 解析 trace 响应
 		scanner := bufio.NewScanner(io.LimitReader(resp.Body, 4096))
 		for scanner.Scan() {
@@ -162,6 +204,11 @@ func (c *Checker) doCheck(ctx context.Context) *Result {
 			}
 		}
 		_ = resp.Body.Close()
+		attemptCancel()
+		if err := scanner.Err(); err != nil {
+			lastErr = err
+			continue
+		}
 
 		if res.TraceWarp == "on" || res.TraceWarp == "plus" {
 			res.Healthy = true

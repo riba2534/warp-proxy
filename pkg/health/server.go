@@ -36,27 +36,21 @@ type StatusResponse struct {
 
 // NewServer 创建 HTTP 健康检查服务
 func NewServer(listenAddr string, checker *Checker, stats *forwarder.Stats, statusProvider WarpStatusProvider) *Server {
-	return &Server{
+	s := &Server{
 		listenAddr:     listenAddr,
 		checker:        checker,
 		stats:          stats,
 		statusProvider: statusProvider,
 	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/status", s.handleStatus)
+	s.httpServer = &http.Server{Addr: listenAddr, Handler: mux, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second}
+	return s
 }
 
 // Start 启动 HTTP 健康检查服务
 func (s *Server) Start() error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", s.handleHealthz)
-	mux.HandleFunc("/status", s.handleStatus)
-
-	s.httpServer = &http.Server{
-		Addr:         s.listenAddr,
-		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 15 * time.Second,
-	}
-
 	log.Printf("[Health] Health check HTTP server listening on %s", s.listenAddr)
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("health check HTTP server failed: %w", err)

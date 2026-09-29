@@ -5,8 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -29,35 +28,29 @@ func NewController(cfg *config.Config) *Controller {
 
 // IsRegistered 检查本地是否已有有效的 WARP 注册信息
 func (c *Controller) IsRegistered(ctx context.Context) bool {
-	// 1. 检查物理文件路径是否已有注册凭证
-	warpDataDir := "/var/lib/cloudflare-warp"
-	possibleFiles := []string{
-		filepath.Join(warpDataDir, "settings.json"),
-		filepath.Join(warpDataDir, "reg.json"),
-		filepath.Join(warpDataDir, "identity.json"),
+	registered, err := c.registrationState(ctx)
+	return err == nil && registered
+}
+
+func (c *Controller) registrationState(ctx context.Context) (bool, error) {
+	out, err := c.executor.RegistrationShow(ctx)
+	lower := strings.ToLower(out)
+	if strings.Contains(lower, "registration missing") || strings.Contains(lower, "missing registration") || strings.Contains(lower, "not registered") || strings.Contains(lower, "no registration") {
+		return false, nil
 	}
-
-	for _, file := range possibleFiles {
-		if fi, err := os.Stat(file); err == nil && fi.Size() > 0 {
-			return true
-		}
+	if err != nil {
+		return false, fmt.Errorf("cannot verify registration: %w", err)
 	}
-
-	// 2. 通过 CLI 检查注册信息
-	ctxTimeout, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
-	out, err := c.executor.RegistrationShow(ctxTimeout)
-	if err == nil && !strings.Contains(strings.ToLower(out), "missing") &&
-		!strings.Contains(strings.ToLower(out), "error") {
-		return true
+	if strings.TrimSpace(out) == "" || strings.Contains(lower, "error") {
+		return false, fmt.Errorf("unexpected registration response")
 	}
-
-	return false
+	return true, nil
 }
 
 // WaitForDaemon 等待 warp-svc 后台守护进程准备就绪并可响应 CLI 请求
 func (c *Controller) WaitForDaemon(ctx context.Context, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -82,8 +75,14 @@ func (c *Controller) WaitForDaemon(ctx context.Context, timeout time.Duration) e
 
 // SetupAndConnect 执行完整的 WARP 初始化与连接流程
 func (c *Controller) SetupAndConnect(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.ConnectTimeout)
+	defer cancel()
 	// 1. 确保已注册账号
-	if !c.IsRegistered(ctx) {
+	registered, registrationErr := c.registrationState(ctx)
+	if registrationErr != nil {
+		return registrationErr
+	}
+	if !registered {
 		log.Println("[WARP] No existing registration found, registering new WARP account...")
 		out, err := c.executor.RegistrationNew(ctx)
 		if err != nil {
@@ -99,7 +98,7 @@ func (c *Controller) SetupAndConnect(ctx context.Context) error {
 		log.Println("[WARP] Applying WARP+ License Key...")
 		out, err := c.executor.RegistrationLicense(ctx, c.cfg.LicenseKey)
 		if err != nil {
-			log.Printf("[WARP] Warning: failed to apply License Key: %v (output: %s)", err, out)
+			slog.Warn("Failed to apply WARP license", "error", err, "output", out)
 		} else {
 			log.Println("[WARP] License Key applied successfully")
 		}
@@ -120,7 +119,7 @@ func (c *Controller) SetupAndConnect(ctx context.Context) error {
 	// 5. 发起连接
 	log.Println("[WARP] Connecting to Cloudflare WARP network...")
 	if out, err := c.executor.Connect(ctx); err != nil {
-		log.Printf("[WARP] Warning: connect command returned: %v (output: %s)", err, out)
+		slog.Warn("WARP connect command failed", "error", err, "output", out)
 	}
 
 	// 6. 轮询等待连接成功
@@ -134,6 +133,8 @@ func (c *Controller) SetupAndConnect(ctx context.Context) error {
 
 // WaitForConnected 持续轮询直到状态变为 Connected
 func (c *Controller) WaitForConnected(ctx context.Context, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
