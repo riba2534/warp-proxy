@@ -192,7 +192,9 @@ func (t *Tunnel) Status() (Status, error) {
 }
 
 // RotateEndpoint moves to the next candidate (wrapping) that resolves and
-// updates the peer in place. On failure the current endpoint is kept.
+// replaces the peer with one using it, so a handshake with the new endpoint
+// starts at once; the per-peer counters restart. Link and routing stay as
+// they are. On failure the current endpoint is kept.
 func (t *Tunnel) RotateEndpoint() (string, error) {
 	t.rotateMu.Lock()
 	defer t.rotateMu.Unlock()
@@ -213,8 +215,8 @@ func (t *Tunnel) RotateEndpoint() (string, error) {
 	if t.closed {
 		return "", errClosed
 	}
-	if err := t.dev.setEndpoint(ep); err != nil {
-		return "", fmt.Errorf("set endpoint %v: %w", ep, err)
+	if err := t.dev.replacePeer(ep); err != nil {
+		return "", fmt.Errorf("replace peer for endpoint %v: %w", ep, err)
 	}
 	t.current, t.endpoint = idx, ep
 	t.log.Info("WireGuard endpoint rotated", "candidate", t.cfg.Endpoints[idx], "endpoint", ep)

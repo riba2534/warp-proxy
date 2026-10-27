@@ -13,19 +13,14 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-func TestUAPIConfig(t *testing.T) {
-	private, peer := testKey(t), testKey(t).PublicKey()
-	got := uapiConfig(deviceParams{
-		name:      "wg0",
-		mtu:       1280,
-		private:   private,
-		peer:      peer,
-		endpoint:  netip.MustParseAddrPort("[2606:4700:d0::a29f:c001]:2408"),
-		keepalive: 25 * time.Second,
-	})
-	// No fwmark: WireGuard's own UDP must keep using the main table.
-	want := "private_key=" + hex.EncodeToString(private[:]) + "\n" +
-		"replace_peers=true\n" +
+func TestUAPIPeer(t *testing.T) {
+	peer := testKey(t).PublicKey()
+	d := &userspaceDevice{peerPK: peer, keepalive: 25 * time.Second}
+	// Also what RotateEndpoint applies: replacing the peer drops its session,
+	// and the new peer's keepalive starts a handshake. No fwmark: WireGuard's
+	// own UDP must keep using the main table.
+	got := d.uapiPeer(netip.MustParseAddrPort("[2606:4700:d0::a29f:c001]:2408"))
+	want := "replace_peers=true\n" +
 		"public_key=" + hex.EncodeToString(peer[:]) + "\n" +
 		"endpoint=[2606:4700:d0::a29f:c001]:2408\n" +
 		"persistent_keepalive_interval=25\n" +
@@ -37,12 +32,18 @@ func TestUAPIConfig(t *testing.T) {
 	}
 }
 
-func TestUAPIEndpoint(t *testing.T) {
+func TestKernelPeerConfig(t *testing.T) {
 	peer := testKey(t).PublicKey()
-	got := uapiEndpoint(peer, netip.MustParseAddrPort("162.159.192.1:500"))
-	want := "public_key=" + hex.EncodeToString(peer[:]) + "\nupdate_only=true\nendpoint=162.159.192.1:500\n"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
+	d := &kernelDevice{peerPK: peer, keepalive: 25 * time.Second}
+	cfg := d.peerConfig(netip.MustParseAddrPort("162.159.192.1:500"))
+	if !cfg.ReplacePeers || cfg.PrivateKey != nil || cfg.FirewallMark != nil || len(cfg.Peers) != 1 {
+		t.Fatalf("device config: %+v", cfg)
+	}
+	p := cfg.Peers[0]
+	if p.PublicKey != peer || p.UpdateOnly || p.Endpoint.String() != "162.159.192.1:500" ||
+		*p.PersistentKeepaliveInterval != 25*time.Second || !p.ReplaceAllowedIPs || len(p.AllowedIPs) != 2 ||
+		p.AllowedIPs[0].String() != "0.0.0.0/0" || p.AllowedIPs[1].String() != "::/0" {
+		t.Fatalf("peer config: %+v", p)
 	}
 }
 
