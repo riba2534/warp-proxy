@@ -750,13 +750,53 @@ func TestUpRefusesForeignTunnelAddress(t *testing.T) {
 	must(t, addAddrs(host, clientInner4+"/32"))
 
 	_, err := Up(context.Background(), b.config(t, ModeAuto, endpoint))
-	if err == nil || !strings.Contains(err.Error(), "already assigned to hostwarp") {
+	if err == nil || !strings.Contains(err.Error(), "needed by the tunnel but already assigned to hostwarp") {
 		t.Fatalf("Up with %s taken: %v", clientInner4, err)
 	}
 	assertRemoved(t) // nothing created
 	addrs, err := netlink.AddrList(host, netlink.FAMILY_V4)
 	if err != nil || len(addrs) != 1 || addrs[0].IP.String() != clientInner4 {
 		t.Fatalf("foreign address touched: %v %v", addrs, err)
+	}
+}
+
+// A killed instance may leave its link under an earlier WG_INTERFACE name;
+// it still holds the tunnel address and must not block the next start.
+func TestUpRemovesRenamedStaleLink(t *testing.T) {
+	stale := map[string]func(t *testing.T, b *testbed) netlink.Link{
+		"tagged": func(t *testing.T, _ *testbed) netlink.Link {
+			link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "oldwarp"}}
+			must(t, netlink.LinkAdd(link))
+			must(t, netlink.LinkSetAlias(link, linkAlias))
+			return link
+		},
+		"untagged kernel link with our key": func(t *testing.T, b *testbed) netlink.Link {
+			if !kernelWireGuard(t) {
+				skipWithoutKernelWireGuard(t)
+			}
+			link := &netlink.Wireguard{LinkAttrs: netlink.LinkAttrs{Name: "oldwarp"}}
+			must(t, netlink.LinkAdd(link))
+			client, err := wgctrl.New()
+			must(t, err)
+			err = client.ConfigureDevice("oldwarp", wgtypes.Config{PrivateKey: &b.clientKey})
+			client.Close()
+			must(t, err)
+			return link
+		},
+	}
+	for name, create := range stale {
+		t.Run(name, func(t *testing.T) {
+			b := newTestbed(t)
+			old := create(t, b)
+			t.Cleanup(func() { _ = netlink.LinkDel(old) })
+			must(t, addAddrs(old, clientInner4+"/32"))
+
+			up(t, b.config(t, ModeUserspace, endpoint))
+			if _, err := netlink.LinkByName("oldwarp"); !notExist(err) {
+				t.Fatalf("stale link under the old name still present (err %v)", err)
+			}
+			expectSource(t, publicV4, marked, clientInner4)
+		})
 	}
 }
 

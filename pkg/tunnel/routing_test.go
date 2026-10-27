@@ -4,8 +4,11 @@ package tunnel
 
 import (
 	"errors"
+	"maps"
 	"math"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -106,15 +109,57 @@ func TestAddressConflict(t *testing.T) {
 		return *a
 	}
 	free := []netlink.Addr{addr("127.0.0.1/8", 1), addr("10.0.0.2/24", 2), addr("172.16.0.3/32", 3), addr("::1/128", 1)}
-	if a, ok := addressConflict(free, want); ok {
-		t.Fatalf("unexpected conflict with %v", a)
+	if c := addressConflicts(free, want); len(c) != 0 {
+		t.Fatalf("unexpected conflicts %v", c)
 	}
-	// A host's own WARP tunnel holds the same address, whatever its prefix length.
-	for _, taken := range []netlink.Addr{addr("172.16.0.2/32", 9), addr("172.16.0.2/12", 9), addr("2606:4700:110::2/64", 9)} {
-		a, ok := addressConflict(append(free, taken), want)
-		if !ok || a.LinkIndex != 9 {
-			t.Fatalf("conflict with %v not found", taken)
+	// Another link holds a tunnel address, whatever its prefix length.
+	taken := []netlink.Addr{addr("172.16.0.2/32", 7), addr("172.16.0.2/12", 8), addr("2606:4700:110::2/64", 9)}
+	c := addressConflicts(append(free, taken...), want)
+	if len(c) != 3 || c[0].LinkIndex != 7 || c[1].LinkIndex != 8 || c[2].LinkIndex != 9 {
+		t.Fatalf("conflicts %v, want links 7, 8, 9", c)
+	}
+}
+
+func TestIPv6DisabledIn(t *testing.T) {
+	tree := func(values map[string]string) string {
+		dir := t.TempDir()
+		for iface, v := range values {
+			if err := os.Mkdir(filepath.Join(dir, iface), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, iface, "disable_ipv6"), []byte(v+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
 		}
+		return dir
+	}
+	off := map[string]string{"all": "1", "default": "1", "lo": "1", "eth0": "1"}
+	cases := []struct {
+		name     string
+		change   map[string]string
+		disabled bool
+	}{
+		{"everything off", nil, true},
+		{"one interface re-enabled", map[string]string{"eth0": "0"}, false},
+		{"default on", map[string]string{"default": "0"}, false},
+		{"all on", map[string]string{"all": "0"}, false},
+		{"all missing", map[string]string{"all": ""}, false},
+	}
+	for _, tc := range cases {
+		values := maps.Clone(off)
+		for k, v := range tc.change {
+			if v == "" {
+				delete(values, k)
+			} else {
+				values[k] = v
+			}
+		}
+		if got := ipv6DisabledIn(tree(values)); got != tc.disabled {
+			t.Fatalf("%s: got %v", tc.name, got)
+		}
+	}
+	if ipv6DisabledIn(filepath.Join(t.TempDir(), "missing")) {
+		t.Fatal("a missing tree must not count as disabled")
 	}
 }
 
