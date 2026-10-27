@@ -8,20 +8,21 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/riba2534/warp-proxy/pkg/forwarder"
+	"github.com/riba2534/warp-proxy/pkg/proxy"
+	"github.com/riba2534/warp-proxy/pkg/tunnel"
 )
 
-// WarpStatusProvider 提供当前 WARP 状态文本的接口
-type WarpStatusProvider interface {
-	GetStatus(ctx context.Context) (string, error)
+// TunnelStatusProvider 提供 WireGuard 隧道的实时状态
+type TunnelStatusProvider interface {
+	Status() (tunnel.Status, error)
 }
 
 // Server 提供健康检查与运行状态 HTTP API
 type Server struct {
 	listenAddr     string
 	checker        *Checker
-	stats          *forwarder.Stats
-	statusProvider WarpStatusProvider
+	stats          *proxy.Stats
+	statusProvider TunnelStatusProvider
 	httpServer     *http.Server
 }
 
@@ -29,13 +30,14 @@ type Server struct {
 type StatusResponse struct {
 	Status         string             `json:"status"` // healthy 或 unhealthy
 	Timestamp      string             `json:"timestamp"`
-	WarpStatus     string             `json:"warp_status"`
-	TraceResult    *Result            `json:"trace_result,omitempty"`
-	ForwarderStats forwarder.Snapshot `json:"forwarder_stats"`
+	WarpStatus     string         `json:"warp_status"`
+	Tunnel         *tunnel.Status `json:"tunnel,omitempty"`
+	TraceResult    *Result        `json:"trace_result,omitempty"`
+	ForwarderStats proxy.Snapshot `json:"forwarder_stats"`
 }
 
 // NewServer 创建 HTTP 健康检查服务
-func NewServer(listenAddr string, checker *Checker, stats *forwarder.Stats, statusProvider WarpStatusProvider) *Server {
+func NewServer(listenAddr string, checker *Checker, stats *proxy.Stats, statusProvider TunnelStatusProvider) *Server {
 	s := &Server{
 		listenAddr:     listenAddr,
 		checker:        checker,
@@ -81,10 +83,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	traceRes := s.checker.Check(ctx)
 
 	warpStatus := "Unknown"
+	var tunnelStatus *tunnel.Status
 	if s.statusProvider != nil {
-		if st, err := s.statusProvider.GetStatus(ctx); err == nil {
-			warpStatus = st
+		st, err := s.statusProvider.Status()
+		if err == nil {
+			tunnelStatus = &st
 		}
+		warpStatus = describeTunnel(st, err, time.Now())
 	}
 
 	statusText := "unhealthy"
@@ -96,6 +101,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Status:         statusText,
 		Timestamp:      time.Now().UTC().Format(time.RFC3339),
 		WarpStatus:     warpStatus,
+		Tunnel:         tunnelStatus,
 		TraceResult:    traceRes,
 		ForwarderStats: s.stats.GetSnapshot(),
 	}
@@ -108,6 +114,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// describeTunnel 生成人类可读的隧道状态，保留 v1 的 warp_status 字段语义
+func describeTunnel(st tunnel.Status, err error, now time.Time) string {
+	if err != nil {
+		return fmt.Sprintf("Disconnected: %v", err)
+	}
+	if st.LastHandshake.IsZero() {
+		return fmt.Sprintf("Connecting (%s WireGuard via %s, no handshake yet)", st.Mode, st.Endpoint)
+	}
+	return fmt.Sprintf("Connected (%s WireGuard via %s, last handshake %s ago)",
+		st.Mode, st.Endpoint, now.Sub(st.LastHandshake).Truncate(time.Second))
 }
 
 // Stop 优雅停止 HTTP 服务

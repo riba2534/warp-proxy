@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/riba2534/warp-proxy/pkg/cfwarp"
 	"github.com/riba2534/warp-proxy/pkg/config"
 	"github.com/riba2534/warp-proxy/pkg/health"
 	"github.com/riba2534/warp-proxy/pkg/supervisor"
@@ -17,7 +18,7 @@ import (
 
 var (
 	// Version 版本号，可在编译时通过 -ldflags "-X main.Version=..." 注入
-	Version   = "1.0.0"
+	Version   = "2.0.0-dev"
 	BuildTime = "unknown"
 	GitCommit = "unknown"
 )
@@ -28,9 +29,11 @@ func main() {
 	var (
 		flagHealthcheck bool
 		flagVersion     bool
+		flagUnregister  bool
 	)
 
 	flag.BoolVar(&flagHealthcheck, "healthcheck", false, "以健康检查探针模式运行，通过 SOCKS5 代理测试连通性 (退出码 0: 正常, 1: 异常)")
+	flag.BoolVar(&flagUnregister, "unregister", false, "从 Cloudflare 注销本设备并删除本地注册文件（先停止正在运行的代理）")
 	flag.BoolVar(&flagVersion, "v", false, "显示版本号")
 	flag.BoolVar(&flagVersion, "version", false, "显示版本号")
 	flag.Parse()
@@ -61,11 +64,21 @@ func main() {
 		return
 	}
 
+	if flagUnregister {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := cfwarp.Unregister(ctx, cfwarp.Options{Path: cfg.RegistrationPath()}); err != nil {
+			log.Fatalf("unregister: %v", err)
+		}
+		fmt.Println("WARP device unregistered and local registration removed")
+		return
+	}
+
 	// 主管服务模式 (PID 1)
 	log.Printf("==================================================")
 	log.Printf("  Starting warp-proxy v%s", Version)
-	log.Printf("  Proxy Entry:   %s", cfg.ProxyListenAddr())
-	log.Printf("  Internal Warp: %s", cfg.WarpSvcTargetAddr())
+	log.Printf("  Proxy Entry:   %s (SOCKS5 / SOCKS4 / HTTP CONNECT)", cfg.ProxyListenAddr())
+	log.Printf("  WireGuard:     %s (mode %s, MTU %d)", cfg.WGInterface, cfg.WGMode, cfg.WGMTU)
 	if !cfg.DisableHealthServer && cfg.HealthPort > 0 {
 		log.Printf("  Health Server: %s", cfg.HealthListenAddr())
 	}

@@ -2,53 +2,101 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	"net"
+	"net/netip"
 	"os"
-	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/riba2534/warp-proxy/pkg/cfwarp"
 	"github.com/riba2534/warp-proxy/pkg/config"
-	"github.com/riba2534/warp-proxy/pkg/forwarder"
 	"github.com/riba2534/warp-proxy/pkg/health"
-	"github.com/riba2534/warp-proxy/pkg/warp"
+	"github.com/riba2534/warp-proxy/pkg/proxy"
+	"github.com/riba2534/warp-proxy/pkg/tunnel"
 )
 
-type child struct {
-	cmd  *exec.Cmd
-	done chan struct{}
+// staleHandshake 超过该时长没有握手即视为当前接入点不可用。
+// WireGuard 在有流量（含 25s keepalive）时每 2 分钟重新握手一次。
+const staleHandshake = 3 * time.Minute
+
+// readyPollInterval 是启动阶段等待隧道可用时的探测间隔
+const readyPollInterval = 2 * time.Second
+
+// switchGrace 是建隧道或切换接入点后，判定"没有握手"之前给首次握手留的时间
+const switchGrace = 10 * time.Second
+
+type tunnelHandle interface {
+	Status() (tunnel.Status, error)
+	RotateEndpoint() (string, error)
+	Close() error
 }
 
 type Supervisor struct {
 	cfg       *config.Config
-	warpCtrl  *warp.Controller
-	forwarder *forwarder.Server
+	proxy     *proxy.Server
 	healthSrv *health.Server
 	checker   *health.Checker
 	ctx       context.Context
 	cancel    context.CancelFunc
 	failures  chan error
-	children  []*child
 	workers   sync.WaitGroup
-	ownsDBus  bool
+
+	tunMu      sync.Mutex
+	tun        tunnelHandle
+	lastSwitch time.Time
+
+	// 测试替身：注册、建隧道与连通性探测
+	loadProfile func(ctx context.Context, opts cfwarp.Options) (*cfwarp.Profile, error)
+	tunnelUp    func(ctx context.Context, cfg tunnel.Config) (tunnelHandle, error)
+	probe       func(ctx context.Context) *health.Result
 }
 
 func NewSupervisor(cfg *config.Config) *Supervisor {
 	ctx, cancel := context.WithCancel(context.Background())
-	ctrl := warp.NewController(cfg)
-	fwd := forwarder.NewServer(cfg.ProxyListenAddr(), cfg.WarpSvcTargetAddr())
-	fwd.SetConnectionLimit(cfg.MaxConnections)
+	srv := proxy.NewServer(proxy.Options{
+		ListenAddr:     cfg.ProxyListenAddr(),
+		MaxConnections: cfg.MaxConnections,
+		DialTimeout:    cfg.DialTimeout,
+		DNSServers:     cfg.DNSServers,
+		AllowPrivate:   cfg.AllowPrivateDestinations,
+	})
 	chk := health.NewChecker(cfg.LocalProxyAddr(), cfg.HealthcheckTimeout)
-	s := &Supervisor{cfg: cfg, warpCtrl: ctrl, forwarder: fwd, checker: chk, ctx: ctx, cancel: cancel, failures: make(chan error, 4)}
+	s := &Supervisor{
+		cfg:         cfg,
+		proxy:       srv,
+		checker:     chk,
+		ctx:         ctx,
+		cancel:      cancel,
+		failures:    make(chan error, 4),
+		loadProfile: cfwarp.Load,
+		tunnelUp: func(ctx context.Context, c tunnel.Config) (tunnelHandle, error) {
+			return tunnel.Up(ctx, c)
+		},
+	}
+	s.probe = func(ctx context.Context) *health.Result { return s.checker.Check(ctx) }
 	if !cfg.DisableHealthServer && cfg.HealthPort > 0 {
-		s.healthSrv = health.NewServer(cfg.HealthListenAddr(), chk, fwd.GetStats(), ctrl)
+		s.healthSrv = health.NewServer(cfg.HealthListenAddr(), chk, srv.Stats(), s)
 	}
 	return s
+}
+
+// Status 实现 health.TunnelStatusProvider
+func (s *Supervisor) Status() (tunnel.Status, error) {
+	t := s.currentTunnel()
+	if t == nil {
+		return tunnel.Status{}, errors.New("tunnel not started")
+	}
+	return t.Status()
+}
+
+func (s *Supervisor) currentTunnel() tunnelHandle {
+	s.tunMu.Lock()
+	defer s.tunMu.Unlock()
+	return s.tun
 }
 
 func (s *Supervisor) fail(err error) {
@@ -62,8 +110,8 @@ func (s *Supervisor) fail(err error) {
 	s.cancel()
 }
 
-// Run treats child exit and persistent loss of the WARP path as fatal. Docker
-// restarts PID 1; health labels alone never restart a standalone container.
+// Run treats persistent loss of the WARP path as fatal. Docker restarts PID 1;
+// health labels alone never restart a standalone container.
 func (s *Supervisor) Run() (retErr error) {
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer stop()
@@ -90,28 +138,39 @@ func (s *Supervisor) Run() (retErr error) {
 	if err := s.cfg.Validate(); err != nil {
 		return err
 	}
-	if err := s.setupEnvironment(); err != nil {
-		return err
+	if err := os.MkdirAll(s.cfg.DataDir, 0o700); err != nil {
+		return fmt.Errorf("WARP data dir: %w", err)
 	}
-	if err := s.startDBus(); err != nil {
-		return err
+
+	startCtx, cancelStart := context.WithTimeout(s.ctx, s.cfg.ConnectTimeout)
+	defer cancelStart()
+	profile, err := s.loadProfile(startCtx, cfwarp.Options{
+		Path:       s.cfg.RegistrationPath(),
+		LicenseKey: s.cfg.LicenseKey,
+	})
+	if err != nil {
+		return fmt.Errorf("WARP registration: %w", err)
 	}
-	if err := s.startWarpSvc(); err != nil {
-		return err
+	slog.Info("WARP device loaded", "device", profile.DeviceID, "account", profile.AccountType)
+
+	t, err := s.tunnelUp(startCtx, s.tunnelConfig(profile))
+	if err != nil {
+		return fmt.Errorf("WireGuard tunnel: %w", err)
 	}
-	if err := s.warpCtrl.WaitForDaemon(s.ctx, 15*time.Second); err != nil {
-		return fmt.Errorf("WARP daemon readiness: %w", err)
+	s.tunMu.Lock()
+	s.tun, s.lastSwitch = t, time.Now()
+	s.tunMu.Unlock()
+	if st, err := t.Status(); err == nil {
+		slog.Info("WireGuard tunnel up", "mode", st.Mode, "interface", st.Interface, "endpoint", st.Endpoint, "ipv6", st.IPv6)
 	}
-	if err := s.warpCtrl.SetupAndConnect(s.ctx); err != nil {
-		return fmt.Errorf("WARP initialization: %w", err)
-	}
-	if err := s.forwarder.Listen(); err != nil {
+
+	if err := s.proxy.Listen(); err != nil {
 		return err
 	}
 	s.workers.Add(1)
 	go func() {
 		defer s.workers.Done()
-		if err := s.forwarder.Serve(); err != nil {
+		if err := s.proxy.Serve(); err != nil {
 			s.fail(err)
 		}
 	}()
@@ -124,88 +183,93 @@ func (s *Supervisor) Run() (retErr error) {
 			}
 		}()
 	}
+
+	res, err := s.waitReady(startCtx)
+	if err != nil {
+		return err
+	}
+	slog.Info("WARP proxy ready", "listen", s.cfg.ProxyListenAddr(), "warp", res.TraceWarp, "ip", res.ExternalIP, "colo", res.Colo)
+
 	if s.cfg.RecoveryFailures > 0 {
 		s.workers.Add(1)
 		go func() { defer s.workers.Done(); s.monitorHealth() }()
 	}
-	slog.Info("WARP proxy ready", "listen", s.cfg.ProxyListenAddr())
 	<-s.ctx.Done()
 	return nil
 }
 
-func (s *Supervisor) startChild(name string, cmd *exec.Cmd) error {
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start %s: %w", name, err)
-	}
-	c := &child{cmd: cmd, done: make(chan struct{})}
-	s.children = append(s.children, c)
-	go func() {
-		err := cmd.Wait()
-		close(c.done)
-		s.fail(fmt.Errorf("%s exited unexpectedly: %v", name, err))
-	}()
-	return nil
-}
-
-func (s *Supervisor) setupEnvironment() error {
-	for _, d := range []string{"/var/run/dbus", "/var/lib/cloudflare-warp", "/var/run/cloudflare-warp"} {
-		if err := os.MkdirAll(d, 0755); err != nil {
-			return err
+// tunnelConfig 把注册信息转换成隧道参数；WG_ENDPOINT 覆盖项优先于 Cloudflare 下发的接入点
+func (s *Supervisor) tunnelConfig(p *cfwarp.Profile) tunnel.Config {
+	seen := make(map[string]bool)
+	var endpoints []string
+	for _, ep := range append(append([]string{}, s.cfg.WGEndpoints...), p.Endpoints...) {
+		if !seen[ep] {
+			seen[ep] = true
+			endpoints = append(endpoints, ep)
 		}
 	}
-	ctx, cancel := context.WithTimeout(s.ctx, 3*time.Second)
-	defer cancel()
-	if err := exec.CommandContext(ctx, "dbus-uuidgen", "--ensure").Run(); err != nil {
-		return fmt.Errorf("dbus uuid: %w", err)
+	addrs := []netip.Prefix{p.AddressV4}
+	if p.AddressV6.IsValid() {
+		addrs = append(addrs, p.AddressV6)
 	}
-	return nil
+	return tunnel.Config{
+		Interface:     s.cfg.WGInterface,
+		Mode:          tunnel.Mode(s.cfg.WGMode),
+		PrivateKey:    p.PrivateKey,
+		PeerPublicKey: p.PeerPublicKey,
+		Endpoints:     endpoints,
+		Addresses:     addrs,
+		MTU:           s.cfg.WGMTU,
+	}
 }
 
-func socketAlive(path string) bool {
-	c, err := net.DialTimeout("unix", path, 200*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	c.Close()
-	return true
-}
-
-func (s *Supervisor) startDBus() error {
-	path := "/var/run/dbus/system_bus_socket"
-	if socketAlive(path) {
-		return nil
-	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	_ = os.Remove("/var/run/dbus/pid")
-	if err := s.startChild("dbus-daemon", exec.Command("dbus-daemon", "--system", "--nofork", "--nopidfile")); err != nil {
-		return err
-	}
-	s.ownsDBus = true
-	ctx, cancel := context.WithTimeout(s.ctx, 3*time.Second)
-	defer cancel()
-	ticker := time.NewTicker(50 * time.Millisecond)
+// waitReady 等待首个成功的 WARP trace；握手迟迟不来时轮换接入点
+func (s *Supervisor) waitReady(ctx context.Context) (*health.Result, error) {
+	var last *health.Result
+	ticker := time.NewTicker(readyPollInterval)
 	defer ticker.Stop()
 	for {
+		last = s.probe(ctx)
+		if last.Healthy {
+			return last, nil
+		}
+		s.rotateIfStale("startup")
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("D-Bus readiness: %w", ctx.Err())
-		case <-ticker.C:
-			if socketAlive(path) {
-				return nil
+			if s.ctx.Err() != nil {
+				return nil, s.ctx.Err()
 			}
+			return nil, fmt.Errorf("WARP tunnel not usable within %s: %s", s.cfg.ConnectTimeout, last.Error)
+		case <-ticker.C:
 		}
 	}
 }
 
-func (s *Supervisor) startWarpSvc() error {
-	return s.startChild("warp-svc", exec.Command("warp-svc"))
+// rotateIfStale 在没有近期握手时切换到下一个接入点；刚建好或刚切换的接入点先等首次握手
+func (s *Supervisor) rotateIfStale(reason string) {
+	s.tunMu.Lock()
+	t, since := s.tun, time.Since(s.lastSwitch)
+	s.tunMu.Unlock()
+	if t == nil || since < switchGrace {
+		return
+	}
+	st, err := t.Status()
+	if err == nil && !st.LastHandshake.IsZero() && time.Since(st.LastHandshake) < staleHandshake {
+		return
+	}
+	next, err := t.RotateEndpoint()
+	if err != nil {
+		slog.Warn("WireGuard endpoint rotation failed", "reason", reason, "error", err)
+		return
+	}
+	s.tunMu.Lock()
+	s.lastSwitch = time.Now()
+	s.tunMu.Unlock()
+	slog.Warn("WireGuard handshake stale, rotated endpoint", "reason", reason, "from", st.Endpoint, "to", next)
 }
 
-// Count consecutive failures, allowing the official daemon to reconnect first.
+// Count consecutive failures; rotate stale endpoints first and exit only when the
+// tunnel stays unusable so Docker can restart the container.
 func (s *Supervisor) monitorHealth() {
 	timer := time.NewTimer(s.cfg.RecoveryGrace)
 	defer timer.Stop()
@@ -222,7 +286,7 @@ func (s *Supervisor) monitorHealth() {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
-			res := s.checker.Check(s.ctx)
+			res := s.probe(s.ctx)
 			if res.Healthy {
 				failures = 0
 				continue
@@ -236,6 +300,7 @@ func (s *Supervisor) monitorHealth() {
 				s.fail(fmt.Errorf("WARP unavailable for %d consecutive probes", failures))
 				return
 			}
+			s.rotateIfStale("health probe")
 		}
 	}
 }
@@ -247,32 +312,15 @@ func (s *Supervisor) shutdown() {
 		_ = s.healthSrv.Stop(ctx)
 	}
 	cancel()
-	_ = s.forwarder.Stop()
-	// Terminating warp-svc closes its tunnel; an extra disconnect CLI could block
-	// behind the same unresponsive daemon we are trying to recover.
-	for i := len(s.children) - 1; i >= 0; i-- {
-		terminateChild(s.children[i], 2*time.Second)
-	}
+	_ = s.proxy.Stop()
 	s.workers.Wait()
-	if s.ownsDBus {
-		_ = os.Remove(filepath.Join("/var/run/dbus", "system_bus_socket"))
+	s.tunMu.Lock()
+	t := s.tun
+	s.tun = nil
+	s.tunMu.Unlock()
+	if t != nil {
+		if err := t.Close(); err != nil {
+			slog.Warn("WireGuard tunnel teardown failed", "error", err)
+		}
 	}
-}
-
-func terminateChild(c *child, timeout time.Duration) {
-	select {
-	case <-c.done:
-		return
-	default:
-	}
-	_ = c.cmd.Process.Signal(syscall.SIGTERM)
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-c.done:
-		return
-	case <-timer.C:
-		_ = c.cmd.Process.Kill()
-	}
-	<-c.done
 }
