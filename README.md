@@ -36,7 +36,7 @@
 
 `warp-proxy` 是一个极简的 Cloudflare WARP 容器化代理服务。容器启动时自动注册一个 WARP 设备，在**容器自己的网络命名空间**里建立到 Cloudflare 边缘的 WireGuard 隧道，再由内置的 Go 代理服务在 `1080` 端口提供 SOCKS5 / SOCKS4(a) / HTTP CONNECT 代理。只有代理自己发出的连接（带专用 mark 的套接字）被路由进隧道，出口即 WARP（`warp=on`）；客户端回包、Docker DNS 等其他流量照常走容器原有的路由。
 
-v2 起不再运行 Cloudflare 官方的 `warp-svc`。官方客户端的本地代理模式只能使用 MASQUE 协议，并且常驻内存会随运行时间持续上涨（实测每天 25–45 MB，与流量无关）。v2 改用内核 WireGuard（宿主机内核缺少 WireGuard 时自动回退到用户态 `wireguard-go`），TCP 由内核协议栈承载，进程常驻内存只有十几 MiB 且不随时间增长；镜像也从 1.25 GB 缩小到十几 MB。
+v2 起不再运行 Cloudflare 官方的 `warp-svc`。官方客户端的本地代理模式只能使用 MASQUE 协议，并且常驻内存会随运行时间持续上涨（实测每天 25–45 MB，与流量无关）。v2 改用内核 WireGuard（宿主机内核缺少 WireGuard 时自动回退到用户态 `wireguard-go`），TCP 由内核协议栈承载，进程常驻内存只有十几 MiB 且不随时间增长；镜像也从 1.25 GB 缩小到约 20 MB。
 
 ## 功能总览
 
@@ -245,6 +245,7 @@ docker exec warp-proxy /usr/local/bin/warp-proxy -healthcheck
 - 保留原来挂载的 `/var/lib/cloudflare-warp` 卷即可。v2 首次启动会注册一个新的 WireGuard 设备，写入 `wireguard-account.json`；v1 官方客户端留下的文件不会被修改，回退到 `v1.1.0` 时仍可使用。
 - 新设备意味着新的 WARP 出口 IP（仍是 `warp=on` 的 Cloudflare 地址）。
 - `WARP_SVC_HOST` / `WARP_SVC_PORT` 已不再使用，可以删除。
+- 镜像基于 distroless，不再包含 shell、curl 等工具：健康检查必须写成 exec 形式（`["CMD", "/usr/local/bin/warp-proxy", "-healthcheck"]`），`CMD-SHELL` 或依赖 curl 的写法会一直报 unhealthy；`docker exec ... sh` 也不可用。
 - 建议在 compose 中加入上面的 `sysctls`；`/dev/net/tun` 只在内核没有 WireGuard 时需要。
 - 需要回退时，把镜像换回 `riba2534/warp-proxy:v1.1.0`（按 digest 固定更稳妥）。
 
@@ -253,7 +254,8 @@ docker exec warp-proxy /usr/local/bin/warp-proxy -healthcheck
 - **日志出现 `falling back to userspace`**：宿主机内核没有 WireGuard 模块，已改用 `wireguard-go`。需要映射 `/dev/net/tun`；想用内核模式可在宿主机执行 `modprobe wireguard`。
 - **启动后一直没有握手**：所在网络可能封锁了 WireGuard 的 UDP。服务会自动轮换接入点与端口，也可以用 `WG_ENDPOINT` 指定可用的接入点，例如 `162.159.192.1:2408`。
 - **`/status` 中 `ipv6` 为 `false`**：容器里 IPv6 被禁用，加上 `net.ipv6.conf.all.disable_ipv6=0` 后重建容器。
-- **使用 `network_mode: host`**：可以运行，但网卡、路由表与规则会建在宿主机的网络命名空间里（只影响代理自己的连接）。宿主机已有同名网卡时用 `WG_INTERFACE` 换一个名字。
+- **使用 `network_mode: host`**：可以运行，网卡、路由表与规则会建在宿主机的网络命名空间里，只作用于代理自己的连接，退出时全部撤销。宿主机已有同名网卡时用 `WG_INTERFACE` 换一个名字；宿主机自己已经在用 WARP（例如 wg-quick，地址同为 `172.16.0.2`）时会拒绝启动，此时请改用 bridge 网络。
+- **内核不支持 IPv6 策略路由**（部分 NAS 内核）：日志会提示设置 `net.ipv6.conf.all.disable_ipv6=1`，禁用容器内 IPv6 后只走 IPv4。
 - **注销设备**：停止容器后执行 `docker run --rm -v ./warp-data:/var/lib/cloudflare-warp riba2534/warp-proxy:v2.0.0 -unregister`。
 
 ## 开发与测试

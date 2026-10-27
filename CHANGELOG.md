@@ -33,13 +33,15 @@ independent of traffic), so v2 talks WireGuard to Cloudflare WARP directly.
   on the current account, as in v1.
 - `/status` adds a `tunnel` object (mode, endpoint, last handshake, bytes);
   `warp_status` and `forwarder_stats` keep their names.
-- The image is a static binary on distroless (about 15 MB instead of 1.25 GB).
+- The image is a static binary on distroless (about 20 MB instead of 1.25 GB).
   New settings: `WG_MODE`, `WG_INTERFACE`, `WG_MTU`, `WG_ENDPOINT`,
   `DNS_SERVERS`, `ALLOW_PRIVATE_DESTINATIONS`, `DIAL_TIMEOUT`, `WARP_DATA_DIR`;
   `WARP_SVC_HOST` and `WARP_SVC_PORT` are gone. New flag `-unregister`.
 
 Upgrading creates a new WARP device, so the egress IP changes. Keep the data
 volume; v1 files are left untouched, so rolling back to v1.1.0 still works.
+The image has no shell any more: health checks must use the exec form
+(`["CMD", "/usr/local/bin/warp-proxy", "-healthcheck"]`), not `CMD-SHELL`.
 
 ## v1.1.0
 
