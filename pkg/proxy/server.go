@@ -16,6 +16,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -34,6 +35,11 @@ type Options struct {
 	HandshakeTimeout time.Duration // default 10s, deadline for the client's request
 	DNSServers       []string      // "ip" or "ip:port"; empty = system resolver
 	AllowPrivate     bool          // default false
+	// Mark, when non-zero, is set as SO_MARK on every upstream socket and every
+	// socket to DNSServers before it connects, so routing can send exactly the
+	// proxy's traffic through the tunnel. A socket that cannot be marked is not
+	// dialed (Linux only; elsewhere such dials fail with errors.ErrUnsupported).
+	Mark uint32
 	// Dial is a test hook; it receives IP literals only, after policy.
 	Dial   func(ctx context.Context, network, address string) (net.Conn, error)
 	Logger *slog.Logger
@@ -47,6 +53,9 @@ type Server struct {
 	dial   dialFunc
 	lookup lookupFunc
 	err    error // invalid Options, reported by Listen
+
+	setMark func(c syscall.RawConn, mark uint32) error // setSocketMark; tests replace it
+	markErr atomic.Pointer[error]                      // first failure of setMark
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -75,18 +84,19 @@ func NewServer(opts Options) *Server {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
-		opts:   opts,
-		log:    cmp.Or(opts.Logger, slog.Default()),
-		stats:  NewStats(),
-		dial:   opts.Dial,
-		conns:  make(map[net.Conn]struct{}),
-		ctx:    ctx,
-		cancel: cancel,
+		opts:    opts,
+		log:     cmp.Or(opts.Logger, slog.Default()),
+		stats:   NewStats(),
+		dial:    opts.Dial,
+		conns:   make(map[net.Conn]struct{}),
+		ctx:     ctx,
+		cancel:  cancel,
+		setMark: setSocketMark,
 	}
 	if s.dial == nil {
-		s.dial = defaultDial(opts.AllowPrivate)
+		s.dial = s.defaultDial()
 	}
-	s.lookup, s.err = newLookup(opts.DNSServers)
+	s.lookup, s.err = newLookup(opts.DNSServers, s.markSocket)
 	return s
 }
 

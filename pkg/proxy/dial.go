@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -16,22 +17,23 @@ const minAttemptTimeout = 2 * time.Second
 
 type dialFunc = func(ctx context.Context, network, address string) (net.Conn, error)
 
-// defaultDial dials with TCP keep-alive (Go disables Nagle by default). Unless
-// private destinations are allowed it re-checks the policy behind connect, as
-// defence in depth: Control vets the address the socket is about to connect
-// to, and refuseSelf catches this host's own addresses, which no prefix list
-// covers (the tunnel's global IPv6 address, a host-network public address).
-func defaultDial(allowPrivate bool) dialFunc {
-	d := &net.Dialer{KeepAlive: keepAlivePeriod}
-	if allowPrivate {
+// defaultDial dials with TCP keep-alive (Go disables Nagle by default); Control
+// marks each socket (Options.Mark). Unless private destinations are allowed it
+// also re-checks the policy behind connect, as defence in depth: Control vets
+// the address the socket is about to connect to, and refuseSelf catches this
+// host's own addresses, which no prefix list covers (the tunnel's global IPv6
+// address, a host-network public address).
+func (s *Server) defaultDial() dialFunc {
+	d := &net.Dialer{KeepAlive: keepAlivePeriod, Control: s.markSocket}
+	if s.opts.AllowPrivate {
 		return d.DialContext
 	}
-	d.Control = func(_, address string, _ syscall.RawConn) error {
+	d.Control = func(network, address string, c syscall.RawConn) error {
 		ap, err := netip.ParseAddrPort(address)
 		if err != nil || blocked(ap.Addr()) {
 			return errBlocked
 		}
-		return nil
+		return s.markSocket(network, address, c)
 	}
 	return refuseSelf(d.DialContext)
 }
@@ -67,9 +69,19 @@ func (s *Server) resolve(ctx context.Context, host string) ([]netip.Addr, error)
 	if isLocalhost(host) {
 		return loopbackAddrs, nil
 	}
+	// An absolute name is queried as is: resolv.conf's search list and ndots
+	// cannot turn it into some internal name or add NXDOMAIN round trips.
+	if !strings.HasSuffix(host, ".") {
+		host += "."
+	}
 	addrs, err := s.lookup(ctx, host)
 	if err == nil && len(addrs) == 0 {
 		err = &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
+	if markErr := s.markErr.Load(); err != nil && markErr != nil {
+		// The resolver keeps only the text of a dial error; while sockets
+		// cannot be marked, DNS sockets fail for that reason too.
+		err = *markErr
 	}
 	return addrs, err
 }
