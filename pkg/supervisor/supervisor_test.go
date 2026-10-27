@@ -151,8 +151,8 @@ func TestRunWiresRegistrationIntoTunnelAndProxy(t *testing.T) {
 	if !reflect.DeepEqual(gotCfg.Addresses, []netip.Prefix{testProfile.AddressV4, testProfile.AddressV6}) {
 		t.Errorf("addresses: %v", gotCfg.Addresses)
 	}
-	if gotCfg.Mode != tunnel.ModeUserspace || gotCfg.Interface != "wg0" || gotCfg.MTU != 1280 ||
-		gotCfg.PrivateKey != "priv" || gotCfg.PeerPublicKey != "peer" {
+	if gotCfg.Mode != tunnel.ModeUserspace || gotCfg.Interface != "warp0" || gotCfg.MTU != 1280 ||
+		gotCfg.PrivateKey != "priv" || gotCfg.PeerPublicKey != "peer" || gotCfg.Mark != tunnel.DefaultMark {
 		t.Errorf("tunnel config: %+v", gotCfg)
 	}
 	if _, closed := ft.counts(); closed != 1 {
@@ -219,31 +219,22 @@ func TestRunReportsRegistrationAndTunnelErrors(t *testing.T) {
 	}
 }
 
-func TestRotateIfStale(t *testing.T) {
+func TestRotateRespectsGrace(t *testing.T) {
 	s := NewSupervisor(testConfig(t))
 	ft := &fakeTunnel{status: tunnel.Status{Endpoint: "162.159.192.1:2408"}}
 	s.tun = ft
 
 	// A fresh endpoint gets time for its first handshake.
 	s.lastSwitch = time.Now()
-	s.rotateIfStale("test")
-	if r, _ := ft.counts(); r != 0 {
-		t.Fatalf("rotated inside the grace period")
+	if s.rotate("test") {
+		t.Fatal("rotated inside the grace period")
 	}
-
-	// A recent handshake means the endpoint works.
 	s.lastSwitch = time.Now().Add(-time.Hour)
-	ft.status.LastHandshake = time.Now().Add(-30 * time.Second)
-	s.rotateIfStale("test")
-	if r, _ := ft.counts(); r != 0 {
-		t.Fatalf("rotated despite a recent handshake")
+	if !s.rotate("test") {
+		t.Fatal("did not rotate after the grace period")
 	}
-
-	// No handshake for longer than WireGuard's rekey cycle: move on.
-	ft.status.LastHandshake = time.Now().Add(-staleHandshake - time.Second)
-	s.rotateIfStale("test")
 	if r, _ := ft.counts(); r != 1 {
-		t.Fatalf("stale handshake did not rotate")
+		t.Fatalf("rotations=%d", r)
 	}
 	if time.Since(s.lastSwitch) > time.Second {
 		t.Fatal("rotation did not restart the grace period")
@@ -271,27 +262,152 @@ func TestHandshakeSinceSwitch(t *testing.T) {
 	}
 }
 
-func TestRecoveryThreshold(t *testing.T) {
+// monitorFixture runs monitorHealth against a probe that always fails.
+func monitorFixture(t *testing.T, recoveryFailures int) (*Supervisor, *fakeTunnel, *int) {
 	cfg := testConfig(t)
 	cfg.RecoveryGrace = 0
 	cfg.RecoveryInterval = 10 * time.Millisecond
-	cfg.RecoveryFailures = 3
+	cfg.RecoveryFailures = recoveryFailures
 	s := NewSupervisor(cfg)
-	defer s.shutdown()
+	t.Cleanup(s.shutdown)
+	s.grace = 0
 	ft := &fakeTunnel{}
 	s.tun, s.lastSwitch = ft, time.Now().Add(-time.Hour)
-	s.checker = health.NewChecker("127.0.0.1:1", 10*time.Millisecond)
+	var mu sync.Mutex
+	probes := new(int)
+	s.probe = func(context.Context) *health.Result {
+		mu.Lock()
+		defer mu.Unlock()
+		*probes++
+		return &health.Result{Error: "trace failed"}
+	}
 	go s.monitorHealth()
+	return s, ft, probes
+}
+
+func TestRecoveryRotatesBeforeExit(t *testing.T) {
+	s, ft, _ := monitorFixture(t, 3)
 	select {
 	case err := <-s.failures:
 		if !strings.Contains(err.Error(), "3 consecutive") {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("persistent failure did not trigger recovery")
 	}
-	if r, _ := ft.counts(); r == 0 {
-		t.Error("stale endpoint was never rotated before giving up")
+	// Rotation starts with the second failure; the third one exits.
+	if r, _ := ft.counts(); r != 1 {
+		t.Errorf("rotations before exit = %d, want 1", r)
+	}
+}
+
+func TestRecoveryExitsOnlyAfterRotation(t *testing.T) {
+	s, ft, probes := monitorFixture(t, 1)
+	select {
+	case err := <-s.failures:
+		if !strings.Contains(err.Error(), "2 consecutive") {
+			t.Fatalf("RECOVERY_FAILURES=1 must still try one rotation first: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no exit")
+	}
+	if r, _ := ft.counts(); r != 1 || *probes != 2 {
+		t.Errorf("rotations=%d probes=%d, want 1 and 2", r, *probes)
+	}
+}
+
+func TestRecoveryDisabledKeepsRotating(t *testing.T) {
+	s, ft, _ := monitorFixture(t, 0)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if r, _ := ft.counts(); r >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("RECOVERY_FAILURES=0 stopped rotating endpoints")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case err := <-s.failures:
+		t.Fatalf("RECOVERY_FAILURES=0 must never exit: %v", err)
+	default:
+	}
+}
+
+func TestRecoveryStreakResetsAfterSuccess(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.RecoveryGrace = 0
+	cfg.RecoveryInterval = 10 * time.Millisecond
+	cfg.RecoveryFailures = 2
+	s := NewSupervisor(cfg)
+	t.Cleanup(s.shutdown)
+	s.grace = 0
+	ft := &fakeTunnel{}
+	s.tun, s.lastSwitch = ft, time.Now().Add(-time.Hour)
+	// fail, fail (rotate), recover, then fail for good: the new streak must rotate
+	// again before exiting instead of reusing the earlier rotation.
+	script := []bool{false, false, true}
+	n := 0
+	s.probe = func(context.Context) *health.Result {
+		defer func() { n++ }()
+		if n < len(script) && script[n] {
+			return &health.Result{Healthy: true}
+		}
+		return &health.Result{Error: "trace failed"}
+	}
+	go s.monitorHealth()
+	select {
+	case err := <-s.failures:
+		if !strings.Contains(err.Error(), "3 consecutive") {
+			t.Fatalf("second streak exited too early: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no exit")
+	}
+	if r, _ := ft.counts(); r != 2 {
+		t.Errorf("rotations=%d, want one per failure streak", r)
+	}
+}
+
+func TestRunMonitorsEvenWithoutRecoveryExit(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.RecoveryFailures = 0
+	cfg.RecoveryGrace = 0
+	cfg.RecoveryInterval = 10 * time.Millisecond
+	s := NewSupervisor(cfg)
+	s.grace = 0
+	ft := &fakeTunnel{handshaking: true}
+	s.loadProfile = func(context.Context, cfwarp.Options) (*cfwarp.Profile, error) { return testProfile, nil }
+	s.tunnelUp = func(context.Context, tunnel.Config) (tunnelHandle, error) { return ft, nil }
+	var mu sync.Mutex
+	ready := false
+	s.probe = func(context.Context) *health.Result {
+		mu.Lock()
+		defer mu.Unlock()
+		if !ready { // the startup probe succeeds, everything after fails
+			ready = true
+			return &health.Result{Healthy: true}
+		}
+		return &health.Result{Error: "trace failed"}
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.Run() }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if r, _ := ft.counts(); r > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			s.cancel()
+			<-done
+			t.Fatal("RECOVERY_FAILURES=0 must still monitor and rotate")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	s.cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("RECOVERY_FAILURES=0 must not exit: %v", err)
 	}
 }
 

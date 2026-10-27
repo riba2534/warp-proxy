@@ -38,7 +38,7 @@ func TestConfigLoadDefaults(t *testing.T) {
 	if cfg.RegistrationPath() != "/var/lib/cloudflare-warp/wireguard-account.json" {
 		t.Errorf("unexpected registration path %s", cfg.RegistrationPath())
 	}
-	if cfg.WGMode != "auto" || cfg.WGInterface != "wg0" || cfg.WGMTU != 1280 || len(cfg.WGEndpoints) != 0 {
+	if cfg.WGMode != "auto" || cfg.WGInterface != "warp0" || cfg.WGMTU != 1280 || len(cfg.WGEndpoints) != 0 {
 		t.Errorf("unexpected WireGuard defaults: %+v", cfg)
 	}
 	if !reflect.DeepEqual(cfg.DNSServers, []string{"1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001"}) {

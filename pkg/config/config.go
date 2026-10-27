@@ -66,7 +66,7 @@ func LoadFromEnv() *Config {
 		LicenseKey:               getEnv("WARP_LICENSE_KEY", ""),
 		DataDir:                  getEnv("WARP_DATA_DIR", "/var/lib/cloudflare-warp"),
 		WGMode:                   strings.ToLower(getEnv("WG_MODE", "auto")),
-		WGInterface:              getEnv("WG_INTERFACE", "wg0"),
+		WGInterface:              getEnv("WG_INTERFACE", "warp0"),
 		WGMTU:                    getEnvInt("WG_MTU", 1280),
 		WGEndpoints:              getEnvList("WG_ENDPOINT", ""),
 		DNSServers:               getEnvList("DNS_SERVERS", DefaultDNSServers),

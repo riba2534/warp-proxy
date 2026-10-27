@@ -19,10 +19,6 @@ import (
 	"github.com/riba2534/warp-proxy/pkg/tunnel"
 )
 
-// staleHandshake 超过该时长没有握手即视为当前接入点不可用。
-// WireGuard 在有流量（含 25s keepalive）时每 2 分钟重新握手一次。
-const staleHandshake = 3 * time.Minute
-
 // readyPollInterval 是启动阶段检查握手与探测的间隔
 const readyPollInterval = time.Second
 
@@ -65,6 +61,8 @@ func NewSupervisor(cfg *config.Config) *Supervisor {
 		DialTimeout:    cfg.DialTimeout,
 		DNSServers:     cfg.DNSServers,
 		AllowPrivate:   cfg.AllowPrivateDestinations,
+		// 只有带这个 mark 的套接字（代理的上游连接与 DNS 查询）走隧道
+		Mark: tunnel.DefaultMark,
 	})
 	chk := health.NewChecker(cfg.LocalProxyAddr(), cfg.HealthcheckTimeout)
 	s := &Supervisor{
@@ -190,10 +188,8 @@ func (s *Supervisor) Run() (retErr error) {
 	}
 	slog.Info("WARP proxy ready", "listen", s.cfg.ProxyListenAddr(), "warp", res.TraceWarp, "ip", res.ExternalIP, "colo", res.Colo)
 
-	if s.cfg.RecoveryFailures > 0 {
-		s.workers.Add(1)
-		go func() { defer s.workers.Done(); s.monitorHealth() }()
-	}
+	s.workers.Add(1)
+	go func() { defer s.workers.Done(); s.monitorHealth() }()
 	<-s.ctx.Done()
 	return nil
 }
@@ -220,6 +216,7 @@ func (s *Supervisor) tunnelConfig(p *cfwarp.Profile) tunnel.Config {
 		Endpoints:     endpoints,
 		Addresses:     addrs,
 		MTU:           s.cfg.WGMTU,
+		Mark:          tunnel.DefaultMark,
 	}
 }
 
@@ -235,7 +232,7 @@ func (s *Supervisor) waitReady(ctx context.Context) (*health.Result, error) {
 				return last, nil
 			}
 		} else {
-			s.rotateIfStale("startup")
+			s.rotate("no handshake at startup")
 		}
 		select {
 		case <-ctx.Done():
@@ -260,31 +257,35 @@ func (s *Supervisor) handshakeSinceSwitch() bool {
 	return err == nil && st.LastHandshake.After(since)
 }
 
-// rotateIfStale 在没有近期握手时切换到下一个接入点；刚建好或刚切换的接入点先等首次握手
-func (s *Supervisor) rotateIfStale(reason string) {
+// rotate 切换到下一个接入点；刚建好或刚切换的接入点先等 grace。报告是否发起了切换。
+// 切换是原地进行的，隧道地址不变，新接入点可用时已有的连接不受影响。
+func (s *Supervisor) rotate(reason string) bool {
 	s.tunMu.Lock()
 	t, since := s.tun, time.Since(s.lastSwitch)
 	s.tunMu.Unlock()
 	if t == nil || since < s.grace {
-		return
+		return false
 	}
-	st, err := t.Status()
-	if err == nil && !st.LastHandshake.IsZero() && time.Since(st.LastHandshake) < staleHandshake {
-		return
+	from := ""
+	if st, err := t.Status(); err == nil {
+		from = st.Endpoint
 	}
 	next, err := t.RotateEndpoint()
-	if err != nil {
-		slog.Warn("WireGuard endpoint rotation failed", "reason", reason, "error", err)
-		return
-	}
 	s.tunMu.Lock()
 	s.lastSwitch = time.Now()
 	s.tunMu.Unlock()
-	slog.Warn("WireGuard handshake stale, rotated endpoint", "reason", reason, "from", st.Endpoint, "to", next)
+	if err != nil {
+		slog.Warn("WireGuard endpoint rotation failed", "reason", reason, "error", err)
+		return true
+	}
+	slog.Warn("rotated WireGuard endpoint", "reason", reason, "from", from, "to", next)
+	return true
 }
 
-// Count consecutive failures; rotate stale endpoints first and exit only when the
-// tunnel stays unusable so Docker can restart the container.
+// monitorHealth probes every RECOVERY_INTERVAL. From the second consecutive
+// failure on it rotates the endpoint in place. With RECOVERY_FAILURES > 0 it
+// exits after that many consecutive failures, but only once a rotation has been
+// tried, so Docker restarts the container; 0 keeps probing and rotating forever.
 func (s *Supervisor) monitorHealth() {
 	timer := time.NewTimer(s.cfg.RecoveryGrace)
 	defer timer.Stop()
@@ -295,7 +296,8 @@ func (s *Supervisor) monitorHealth() {
 	}
 	ticker := time.NewTicker(s.cfg.RecoveryInterval)
 	defer ticker.Stop()
-	failures := 0
+	exitAfter := s.cfg.RecoveryFailures
+	failures, rotated := 0, false
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -303,7 +305,7 @@ func (s *Supervisor) monitorHealth() {
 		case <-ticker.C:
 			res := s.probe(s.ctx)
 			if res.Healthy {
-				failures = 0
+				failures, rotated = 0, false
 				continue
 			}
 			if s.ctx.Err() != nil {
@@ -311,11 +313,15 @@ func (s *Supervisor) monitorHealth() {
 			}
 			failures++
 			slog.Warn("WARP health probe failed", "consecutive", failures, "error", res.Error)
-			if failures >= s.cfg.RecoveryFailures {
+			if exitAfter > 0 && failures >= exitAfter && rotated {
 				s.fail(fmt.Errorf("WARP unavailable for %d consecutive probes", failures))
 				return
 			}
-			s.rotateIfStale("health probe")
+			if failures >= 2 || (exitAfter > 0 && failures >= exitAfter) {
+				if s.rotate("health probe failed") {
+					rotated = true
+				}
+			}
 		}
 	}
 }
