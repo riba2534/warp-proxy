@@ -11,7 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"strconv"
+	"path/filepath"
 	"strings"
 
 	"github.com/vishvananda/netlink"
@@ -173,27 +173,38 @@ func tagLink(name string) error {
 	return nil
 }
 
-// checkAddressesFree refuses tunnel addresses that are already assigned in
-// this netns: every WARP device gets 172.16.0.2, and our "from" rule would
-// capture the traffic of a host's own WARP tunnel using it.
-func checkAddressesFree(want []netip.Prefix) error {
+// claimTunnelAddresses makes sure no other link holds a tunnel address, since
+// our "from" rules would capture its traffic: every WARP device gets
+// 172.16.0.2. A stale link of ours, e.g. under an earlier interface name, is
+// removed (callers hold the netns lock); any other holder is refused.
+func claimTunnelAddresses(want []netip.Prefix, private wgtypes.Key, log *slog.Logger) error {
 	assigned, err := netlink.AddrList(nil, netlink.FAMILY_ALL)
 	if err != nil {
 		return fmt.Errorf("list addresses: %w", err)
 	}
-	a, ok := addressConflict(assigned, want)
-	if !ok {
-		return nil
+	for _, a := range addressConflicts(assigned, want) {
+		link, err := netlink.LinkByIndex(a.LinkIndex)
+		if notExist(err) {
+			continue // removed with an earlier conflict
+		}
+		if err != nil {
+			return fmt.Errorf("look up interface %d: %w", a.LinkIndex, err)
+		}
+		name := link.Attrs().Name
+		if !ownLink(link, private, wireguardPrivateKey) {
+			return fmt.Errorf("tunnel address %s is needed by the tunnel but already assigned to %s in this "+
+				"network namespace (the host's own WARP tunnel, or a Docker network handing out this address?)", a.IP, name)
+		}
+		if err := netlink.LinkDel(link); err != nil && !notExist(err) {
+			return fmt.Errorf("delete stale interface %s: %w", name, err)
+		}
+		log.Info("removed stale interface", "name", name, "type", link.Type())
 	}
-	name := strconv.Itoa(a.LinkIndex)
-	if link, err := netlink.LinkByIndex(a.LinkIndex); err == nil {
-		name = link.Attrs().Name
-	}
-	return fmt.Errorf("tunnel address %s is already assigned to %s in this network namespace, "+
-		"probably another WireGuard tunnel; refusing to capture its traffic", a.IP, name)
+	return nil
 }
 
-func addressConflict(assigned []netlink.Addr, want []netip.Prefix) (netlink.Addr, bool) {
+func addressConflicts(assigned []netlink.Addr, want []netip.Prefix) []netlink.Addr {
+	var conflicts []netlink.Addr
 	for _, a := range assigned {
 		ip, ok := netip.AddrFromSlice(a.IP)
 		if !ok {
@@ -201,11 +212,11 @@ func addressConflict(assigned []netlink.Addr, want []netip.Prefix) (netlink.Addr
 		}
 		for _, p := range want {
 			if ip.Unmap() == p.Addr() {
-				return a, true
+				conflicts = append(conflicts, a)
 			}
 		}
 	}
-	return netlink.Addr{}, false
+	return conflicts
 }
 
 // ipv6Confinement decides whether marked IPv6 gets our rules and unreachable
@@ -232,15 +243,36 @@ var ipv6PolicyRouting = func() bool {
 	return !errors.Is(err, unix.EAFNOSUPPORT)
 }
 
-func ipv6Sysctl(iface string) string {
-	b, _ := os.ReadFile("/proc/sys/net/ipv6/conf/" + iface + "/disable_ipv6")
+const ipv6Conf = "/proc/sys/net/ipv6/conf"
+
+func disableIPv6(dir, iface string) string {
+	b, _ := os.ReadFile(filepath.Join(dir, iface, "disable_ipv6"))
 	return strings.TrimSpace(string(b))
 }
 
-func ipv6Enabled() bool { return ipv6Sysctl("all") == "0" }
+func ipv6Enabled() bool { return disableIPv6(ipv6Conf, "all") == "0" }
 
-// ipv6Disabled reports whether no interface, present or future, has IPv6.
-func ipv6Disabled() bool { return ipv6Sysctl("all") == "1" && ipv6Sysctl("default") == "1" }
+func ipv6Disabled() bool { return ipv6DisabledIn(ipv6Conf) }
+
+// ipv6DisabledIn reports whether no interface, present or future, has IPv6
+// in the sysctl tree dir: "all", "default" and every interface must say so,
+// since an interface can turn IPv6 back on for itself.
+func ipv6DisabledIn(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	names := []string{"all", "default"}
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	for _, name := range names {
+		if disableIPv6(dir, name) != "1" {
+			return false
+		}
+	}
+	return true
+}
 
 // ipv6Stack reports whether this netns can open IPv6 sockets at all, i.e.
 // whether marked IPv6 traffic exists that must be kept out of the main table.

@@ -64,7 +64,7 @@ func Up(ctx context.Context, cfg Config) (_ *Tunnel, err error) {
 	if err := removeStaleLink(cfg.Interface, private, t.log); err != nil {
 		return nil, err
 	}
-	if err := checkAddressesFree(cfg.Addresses); err != nil {
+	if err := claimTunnelAddresses(cfg.Addresses, private, t.log); err != nil {
 		return nil, err
 	}
 	stack := ipv6Stack()
