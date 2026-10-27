@@ -36,7 +36,7 @@
 
 `warp-proxy` 是一个极简的 Cloudflare WARP 容器化代理服务。容器启动时自动注册一个 WARP 设备，在**容器自己的网络命名空间**里建立到 Cloudflare 边缘的 WireGuard 隧道，再由内置的 Go 代理服务在 `1080` 端口提供 SOCKS5 / SOCKS4(a) / HTTP CONNECT 代理。只有代理自己发出的连接（带专用 mark 的套接字）被路由进隧道，出口即 WARP（`warp=on`）；客户端回包、Docker DNS 等其他流量照常走容器原有的路由。
 
-v2 起不再运行 Cloudflare 官方的 `warp-svc`。官方客户端的本地代理模式只能使用 MASQUE 协议，并且常驻内存会随运行时间持续上涨（实测每天 25–45 MB，与流量无关）。v2 改用内核 WireGuard（宿主机内核缺少 WireGuard 时自动回退到用户态 `wireguard-go`），TCP 由内核协议栈承载，进程常驻内存只有十几 MiB 且不随时间增长；镜像也从 1.25 GB 缩小到约 20 MB。
+v2 起不再运行 Cloudflare 官方的 `warp-svc`。官方客户端的本地代理模式只能使用 MASQUE 协议，并且常驻内存会随运行时间持续上涨（实测每天 25–45 MB，与流量无关）。v2 改用内核 WireGuard（宿主机内核缺少 WireGuard 时自动回退到用户态 `wireguard-go`），TCP 由内核协议栈承载，不再有常驻的官方守护进程：实测进程常驻内存内核模式约 16–17 MiB、用户态模式约 18–20 MiB，压 2000 条连接和持续运行的观测期内都没有出现增长；镜像也从 1.25 GB 缩小到约 20 MB。
 
 ## 功能总览
 
