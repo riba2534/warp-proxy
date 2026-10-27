@@ -21,6 +21,8 @@ type fakeTunnel struct {
 	mu          sync.Mutex
 	status      tunnel.Status
 	handshaking bool // report a handshake that just happened
+	onRotate    func(*fakeTunnel)
+	rotateCtx   context.Context
 	rotations   int
 	closed      int
 }
@@ -35,11 +37,15 @@ func (f *fakeTunnel) Status() (tunnel.Status, error) {
 	return st, nil
 }
 
-func (f *fakeTunnel) RotateEndpoint() (string, error) {
+func (f *fakeTunnel) RotateEndpoint(ctx context.Context) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rotations++
+	f.rotateCtx = ctx
 	f.status.Endpoint = "162.159.193.10:500"
+	if f.onRotate != nil {
+		f.onRotate(f)
+	}
 	return f.status.Endpoint, nil
 }
 
@@ -238,6 +244,58 @@ func TestRotateRespectsGrace(t *testing.T) {
 	}
 	if time.Since(s.lastSwitch) > time.Second {
 		t.Fatal("rotation did not restart the grace period")
+	}
+}
+
+func TestHandshakeDuringUpCounts(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ConnectTimeout = 2 * time.Second
+	s := NewSupervisor(cfg)
+	s.grace = time.Hour // a missed handshake would never be rotated away from
+	ft := &fakeTunnel{}
+	probed := make(chan struct{}, 1)
+	s.loadProfile = func(context.Context, cfwarp.Options) (*cfwarp.Profile, error) { return testProfile, nil }
+	s.tunnelUp = func(context.Context, tunnel.Config) (tunnelHandle, error) {
+		// Kernel WireGuard can complete the first handshake before Up returns.
+		ft.status.LastHandshake = time.Now()
+		time.Sleep(5 * time.Millisecond)
+		return ft, nil
+	}
+	s.probe = func(context.Context) *health.Result {
+		select {
+		case probed <- struct{}{}:
+		default:
+		}
+		return &health.Result{Healthy: true}
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.Run() }()
+	select {
+	case <-probed:
+	case err := <-done:
+		t.Fatalf("handshake completed during Up was ignored: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("never probed")
+	}
+	s.cancel()
+	<-done
+}
+
+func TestHandshakeDuringRotationCounts(t *testing.T) {
+	s := NewSupervisor(testConfig(t))
+	ft := &fakeTunnel{onRotate: func(f *fakeTunnel) { f.status.LastHandshake = time.Now() }}
+	s.tun, s.lastSwitch = ft, time.Now().Add(-time.Hour)
+	time.Sleep(2 * time.Millisecond)
+	if !s.rotate("test") {
+		t.Fatal("did not rotate")
+	}
+	if !s.handshakeSinceSwitch() {
+		t.Fatal("handshake completed during RotateEndpoint was ignored")
+	}
+	// Shutdown must be able to cut a rotation short (its DNS lookups take up to 10s).
+	s.cancel()
+	if ft.rotateCtx == nil || ft.rotateCtx.Err() == nil {
+		t.Fatal("RotateEndpoint did not get the supervisor's context")
 	}
 }
 

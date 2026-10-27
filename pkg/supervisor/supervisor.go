@@ -28,7 +28,7 @@ const switchGrace = 6 * time.Second
 
 type tunnelHandle interface {
 	Status() (tunnel.Status, error)
-	RotateEndpoint() (string, error)
+	RotateEndpoint(ctx context.Context) (string, error)
 	Close() error
 }
 
@@ -154,12 +154,14 @@ func (s *Supervisor) Run() (retErr error) {
 	}
 	slog.Info("WARP device loaded", "device", profile.DeviceID, "account", profile.AccountType)
 
+	// 握手可能在 Up 返回之前就已完成（内核模式到边缘只要 1ms），所以在调用前记时间
+	switched := time.Now()
 	t, err := s.tunnelUp(startCtx, s.tunnelConfig(profile))
 	if err != nil {
 		return fmt.Errorf("WireGuard tunnel: %w", err)
 	}
 	s.tunMu.Lock()
-	s.tun, s.lastSwitch = t, time.Now()
+	s.tun, s.lastSwitch = t, switched
 	s.tunMu.Unlock()
 
 	if err := s.proxy.Listen(); err != nil {
@@ -277,9 +279,10 @@ func (s *Supervisor) rotate(reason string) bool {
 	if st, err := t.Status(); err == nil {
 		from = st.Endpoint
 	}
-	next, err := t.RotateEndpoint()
+	switched := time.Now()
+	next, err := t.RotateEndpoint(s.ctx)
 	s.tunMu.Lock()
-	s.lastSwitch = time.Now()
+	s.lastSwitch = switched
 	s.tunMu.Unlock()
 	if err != nil {
 		slog.Warn("WireGuard endpoint rotation failed", "reason", reason, "error", err)
