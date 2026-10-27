@@ -523,13 +523,13 @@ func TestEndToEnd(t *testing.T) {
 		// packets have arrived nothing makes WireGuard roam back, so the
 		// dead endpoint must show.
 		waitQuiet(t, tn)
-		if ep, err := tn.RotateEndpoint(); err != nil || ep != deadEndpoint {
+		if ep, err := tn.RotateEndpoint(context.Background()); err != nil || ep != deadEndpoint {
 			t.Fatalf("rotate: %q %v", ep, err)
 		}
 		if _, err := sourceSeenBy(publicV4, marked, 500*time.Millisecond); err == nil {
 			t.Fatal("traffic flowed through a dead endpoint")
 		}
-		if ep, err := tn.RotateEndpoint(); err != nil || ep != endpoint {
+		if ep, err := tn.RotateEndpoint(context.Background()); err != nil || ep != endpoint {
 			t.Fatalf("rotation did not wrap: %q %v", ep, err)
 		}
 		expectSource(t, publicV4, marked, clientInner4)
@@ -540,7 +540,7 @@ func TestEndToEnd(t *testing.T) {
 		if _, err := tn.Status(); err == nil {
 			t.Fatal("Status after Close succeeded")
 		}
-		if _, err := tn.RotateEndpoint(); err == nil {
+		if _, err := tn.RotateEndpoint(context.Background()); err == nil {
 			t.Fatal("RotateEndpoint after Close succeeded")
 		}
 		expectSource(t, publicV4, unmarked, clientVeth4)
@@ -633,7 +633,7 @@ func TestRotateSkipsUnresolvableHostname(t *testing.T) {
 			t.Fatal("traffic flowed through a dead endpoint")
 		}
 		start := time.Now()
-		ep, err := tn.RotateEndpoint()
+		ep, err := tn.RotateEndpoint(context.Background())
 		if elapsed := time.Since(start); elapsed > resolveBudget+time.Second {
 			t.Fatalf("RotateEndpoint took %v", elapsed)
 		}
@@ -642,6 +642,27 @@ func TestRotateSkipsUnresolvableHostname(t *testing.T) {
 		}
 		expectSource(t, publicV4, marked, clientInner4)
 	})
+}
+
+func TestRotateHonoursContext(t *testing.T) {
+	b := newTestbed(t)
+	// Real limits (3s per hostname); the context is what has to end the lookup.
+	tn := up(t, b.config(t, ModeUserspace, deadEndpoint, unresolvable, endpoint))
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	ep, err := tn.RotateEndpoint(ctx)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("RotateEndpoint took %v with a 300ms context", elapsed)
+	}
+	if err != nil || ep != endpoint { // the IP literal needs no lookup
+		t.Fatalf("rotate: %q %v", ep, err)
+	}
+	cancelled, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	if _, err := tn.RotateEndpoint(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("rotate with a cancelled context: %v", err)
+	}
 }
 
 func TestRotateStartsFreshHandshake(t *testing.T) {
@@ -658,7 +679,7 @@ func TestRotateStartsFreshHandshake(t *testing.T) {
 		must(t, netlink.RouteAdd(blackhole))
 		t.Cleanup(func() { _ = netlink.RouteDel(blackhole) })
 		rotated := time.Now()
-		if ep, err := tn.RotateEndpoint(); err != nil || ep != endpointB {
+		if ep, err := tn.RotateEndpoint(context.Background()); err != nil || ep != endpointB {
 			t.Fatalf("rotate: %q %v", ep, err)
 		}
 		// B has never seen A's session: only a new handshake brings traffic back.
@@ -877,15 +898,17 @@ func assertForeignRules(t *testing.T, want []netlink.Rule) {
 func TestSecondTunnelRefused(t *testing.T) {
 	b := newTestbed(t)
 	first := up(t, b.config(t, ModeUserspace, endpoint))
+	// Another device: its own interface and addresses, so only the lock can stop it.
 	second := b.config(t, ModeUserspace, endpoint)
 	second.Interface = "warp1"
+	second.Addresses = []netip.Prefix{netip.MustParsePrefix("172.16.0.3/32")}
 	if _, err := Up(context.Background(), second); err == nil || !strings.Contains(err.Error(), "another warp-proxy tunnel") {
 		t.Fatalf("second Up in the same netns: %v", err)
 	}
 	assertRouting(t, true) // the first tunnel is untouched
 	expectSource(t, publicV4, marked, clientInner4)
 	must(t, first.Close())
-	up(t, second) // the lock is released by Close
+	up(t, b.config(t, ModeUserspace, endpoint)) // Close released the lock
 	expectSource(t, publicV4, marked, clientInner4)
 }
 
@@ -910,7 +933,7 @@ func TestConcurrentUse(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for {
-				if _, err := tn.RotateEndpoint(); err != nil {
+				if _, err := tn.RotateEndpoint(context.Background()); err != nil {
 					return
 				}
 			}

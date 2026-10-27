@@ -17,7 +17,7 @@ func TestUnsupportedPlatform(t *testing.T) {
 	if _, err := zero.Status(); !errors.Is(err, errors.ErrUnsupported) {
 		t.Fatalf("Status: %v", err)
 	}
-	if _, err := zero.RotateEndpoint(); !errors.Is(err, errors.ErrUnsupported) {
+	if _, err := zero.RotateEndpoint(context.Background()); !errors.Is(err, errors.ErrUnsupported) {
 		t.Fatalf("RotateEndpoint: %v", err)
 	}
 	if err := zero.Close(); err != nil {

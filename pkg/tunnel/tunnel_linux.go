@@ -200,8 +200,12 @@ func (t *Tunnel) Status() (Status, error) {
 // RotateEndpoint moves to the next candidate (wrapping) that resolves and
 // replaces the peer with one using it, so a handshake with the new endpoint
 // starts at once; the per-peer counters restart. Link and routing stay as
-// they are. On failure the current endpoint is kept.
-func (t *Tunnel) RotateEndpoint() (string, error) {
+// they are. Hostname resolution ends with ctx (and within 10s anyway); IP
+// literals need none. On failure the current endpoint is kept.
+func (t *Tunnel) RotateEndpoint(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	t.rotateMu.Lock()
 	defer t.rotateMu.Unlock()
 	t.mu.Lock()
@@ -211,7 +215,7 @@ func (t *Tunnel) RotateEndpoint() (string, error) {
 		return "", errClosed
 	}
 
-	idx, ep, err := pickEndpoint(context.Background(), t.cfg.Endpoints, next, t.resolver.resolve)
+	idx, ep, err := pickEndpoint(ctx, t.cfg.Endpoints, next, t.resolver.resolve)
 	if err != nil {
 		return "", err
 	}
