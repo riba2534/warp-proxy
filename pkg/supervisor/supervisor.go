@@ -42,8 +42,12 @@ type Supervisor struct {
 	failures  chan error
 	workers   sync.WaitGroup
 
-	tunMu      sync.Mutex
-	tun        tunnelHandle
+	tunMu sync.Mutex
+	tun   tunnelHandle
+	// switchedAt: when Up or the last rotation started; a later handshake
+	// belongs to the current endpoint. lastSwitch: when it returned; the grace
+	// period starts there, so slow endpoint lookups do not eat into it.
+	switchedAt time.Time
 	lastSwitch time.Time
 	grace      time.Duration // switchGrace; tests shorten it
 
@@ -155,13 +159,13 @@ func (s *Supervisor) Run() (retErr error) {
 	slog.Info("WARP device loaded", "device", profile.DeviceID, "account", profile.AccountType)
 
 	// 握手可能在 Up 返回之前就已完成（内核模式到边缘只要 1ms），所以在调用前记时间
-	switched := time.Now()
+	started := time.Now()
 	t, err := s.tunnelUp(startCtx, s.tunnelConfig(profile))
 	if err != nil {
 		return fmt.Errorf("WireGuard tunnel: %w", err)
 	}
 	s.tunMu.Lock()
-	s.tun, s.lastSwitch = t, switched
+	s.tun, s.switchedAt, s.lastSwitch = t, started, time.Now()
 	s.tunMu.Unlock()
 
 	if err := s.proxy.Listen(); err != nil {
@@ -257,7 +261,7 @@ func (s *Supervisor) sinceSwitch() time.Duration {
 // handshakeSinceSwitch 报告当前接入点在建隧道或最近一次切换之后是否完成过握手
 func (s *Supervisor) handshakeSinceSwitch() bool {
 	s.tunMu.Lock()
-	t, since := s.tun, s.lastSwitch
+	t, since := s.tun, s.switchedAt
 	s.tunMu.Unlock()
 	if t == nil {
 		return false
@@ -279,10 +283,10 @@ func (s *Supervisor) rotate(reason string) bool {
 	if st, err := t.Status(); err == nil {
 		from = st.Endpoint
 	}
-	switched := time.Now()
+	started := time.Now()
 	next, err := t.RotateEndpoint(s.ctx)
 	s.tunMu.Lock()
-	s.lastSwitch = switched
+	s.switchedAt, s.lastSwitch = started, time.Now()
 	s.tunMu.Unlock()
 	if err != nil {
 		slog.Warn("WireGuard endpoint rotation failed", "reason", reason, "error", err)

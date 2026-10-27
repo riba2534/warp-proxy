@@ -35,10 +35,11 @@ type Options struct {
 	HandshakeTimeout time.Duration // default 10s, deadline for the client's request
 	DNSServers       []string      // "ip" or "ip:port"; empty = system resolver
 	AllowPrivate     bool          // default false
-	// Mark, when non-zero, is set as SO_MARK on every upstream socket and every
-	// socket to DNSServers before it connects, so routing can send exactly the
-	// proxy's traffic through the tunnel. A socket that cannot be marked is not
-	// dialed (Linux only; elsewhere such dials fail with errors.ErrUnsupported).
+	// Mark, when non-zero, is set as SO_MARK on every upstream and DNSServers
+	// socket to a public address before it connects, so routing can send exactly
+	// the proxy's traffic through the tunnel; internal destinations (the blocked
+	// set) stay unmarked on the normal routes. A socket that cannot be marked is
+	// not dialed (Linux only; elsewhere such dials fail with errors.ErrUnsupported).
 	Mark uint32
 	// Dial is a test hook; it receives IP literals only, after policy.
 	Dial   func(ctx context.Context, network, address string) (net.Conn, error)

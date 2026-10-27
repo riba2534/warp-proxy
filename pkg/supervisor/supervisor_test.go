@@ -299,22 +299,37 @@ func TestHandshakeDuringRotationCounts(t *testing.T) {
 	}
 }
 
+func TestGraceStartsAfterSlowRotation(t *testing.T) {
+	s := NewSupervisor(testConfig(t))
+	s.grace = 100 * time.Millisecond
+	// Endpoint lookups inside RotateEndpoint can take seconds; the new endpoint
+	// still gets its whole grace period afterwards.
+	ft := &fakeTunnel{onRotate: func(*fakeTunnel) { time.Sleep(150 * time.Millisecond) }}
+	s.tun, s.lastSwitch = ft, time.Now().Add(-time.Hour)
+	if !s.rotate("first") {
+		t.Fatal("did not rotate")
+	}
+	if s.rotate("second") {
+		t.Fatal("rotated again before the new endpoint had its grace")
+	}
+}
+
 func TestHandshakeSinceSwitch(t *testing.T) {
 	s := NewSupervisor(testConfig(t))
 	if s.handshakeSinceSwitch() {
 		t.Fatal("no tunnel cannot have a handshake")
 	}
 	ft := &fakeTunnel{}
-	s.tun, s.lastSwitch = ft, time.Now()
+	s.tun, s.switchedAt = ft, time.Now()
 	if s.handshakeSinceSwitch() {
 		t.Fatal("zero handshake counted")
 	}
 	// A handshake with the previous endpoint says nothing about the new one.
-	ft.status.LastHandshake = s.lastSwitch.Add(-time.Second)
+	ft.status.LastHandshake = s.switchedAt.Add(-time.Second)
 	if s.handshakeSinceSwitch() {
 		t.Fatal("handshake from before the switch counted")
 	}
-	ft.status.LastHandshake = s.lastSwitch.Add(time.Second)
+	ft.status.LastHandshake = s.switchedAt.Add(time.Second)
 	if !s.handshakeSinceSwitch() {
 		t.Fatal("handshake after the switch not counted")
 	}
