@@ -18,7 +18,7 @@ const minAttemptTimeout = 2 * time.Second
 type dialFunc = func(ctx context.Context, network, address string) (net.Conn, error)
 
 // defaultDial dials with TCP keep-alive (Go disables Nagle by default); Control
-// marks each socket (Options.Mark). Unless private destinations are allowed it
+// marks each socket to a public destination (Options.Mark). Unless private destinations are allowed it
 // also re-checks the policy behind connect, as defence in depth: Control vets
 // the address the socket is about to connect to, and refuseSelf catches this
 // host's own addresses, which no prefix list covers (the tunnel's global IPv6
