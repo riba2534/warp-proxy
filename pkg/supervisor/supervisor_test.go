@@ -18,16 +18,21 @@ import (
 )
 
 type fakeTunnel struct {
-	mu        sync.Mutex
-	status    tunnel.Status
-	rotations int
-	closed    int
+	mu          sync.Mutex
+	status      tunnel.Status
+	handshaking bool // report a handshake that just happened
+	rotations   int
+	closed      int
 }
 
 func (f *fakeTunnel) Status() (tunnel.Status, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.status, nil
+	st := f.status
+	if f.handshaking {
+		st.LastHandshake = time.Now()
+	}
+	return st, nil
 }
 
 func (f *fakeTunnel) RotateEndpoint() (string, error) {
@@ -102,7 +107,7 @@ func TestRunWiresRegistrationIntoTunnelAndProxy(t *testing.T) {
 	cfg.WGMode = "userspace"
 	cfg.WGEndpoints = []string{"162.159.192.1:2408", "198.51.100.1:500"}
 	s := NewSupervisor(cfg)
-	ft := &fakeTunnel{status: tunnel.Status{Mode: tunnel.ModeUserspace, Endpoint: "162.159.192.1:2408"}}
+	ft := &fakeTunnel{status: tunnel.Status{Mode: tunnel.ModeUserspace, Endpoint: "162.159.192.1:2408"}, handshaking: true}
 	var gotOpts cfwarp.Options
 	var gotCfg tunnel.Config
 	s.loadProfile = func(ctx context.Context, opts cfwarp.Options) (*cfwarp.Profile, error) {
@@ -155,11 +160,11 @@ func TestRunWiresRegistrationIntoTunnelAndProxy(t *testing.T) {
 	}
 }
 
-func TestRunFailsAndCleansUpWhenTunnelNeverWorks(t *testing.T) {
+func TestRunFailsAndCleansUpWhenTraceNeverWorks(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.ConnectTimeout = 300 * time.Millisecond
 	s := NewSupervisor(cfg)
-	ft := &fakeTunnel{}
+	ft := &fakeTunnel{handshaking: true}
 	s.loadProfile = func(context.Context, cfwarp.Options) (*cfwarp.Profile, error) { return testProfile, nil }
 	s.tunnelUp = func(context.Context, tunnel.Config) (tunnelHandle, error) { return ft, nil }
 	s.probe = func(context.Context) *health.Result { return &health.Result{Error: "trace timeout"} }
@@ -173,6 +178,28 @@ func TestRunFailsAndCleansUpWhenTunnelNeverWorks(t *testing.T) {
 	if conn, err := net.DialTimeout("tcp", cfg.ProxyListenAddr(), 200*time.Millisecond); err == nil {
 		conn.Close()
 		t.Error("proxy still listening after failed start")
+	}
+}
+
+func TestStartupRotatesEndpointsWithoutHandshake(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ConnectTimeout = 2500 * time.Millisecond // readiness is checked once a second
+	s := NewSupervisor(cfg)
+	s.grace = 50 * time.Millisecond
+	ft := &fakeTunnel{}
+	probes := 0
+	s.loadProfile = func(context.Context, cfwarp.Options) (*cfwarp.Profile, error) { return testProfile, nil }
+	s.tunnelUp = func(context.Context, tunnel.Config) (tunnelHandle, error) { return ft, nil }
+	s.probe = func(context.Context) *health.Result { probes++; return &health.Result{Error: "unreachable"} }
+	err := runWithin(t, s, 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "no WireGuard handshake yet") {
+		t.Fatalf("expected a handshake error, got %v", err)
+	}
+	if r, closed := ft.counts(); r == 0 || closed != 1 {
+		t.Errorf("rotations=%d closed=%d; want endpoint rotation and teardown", r, closed)
+	}
+	if probes != 0 {
+		t.Errorf("probed %d times without a handshake; a blocked endpoint must not cost a trace timeout", probes)
 	}
 }
 
@@ -220,6 +247,27 @@ func TestRotateIfStale(t *testing.T) {
 	}
 	if time.Since(s.lastSwitch) > time.Second {
 		t.Fatal("rotation did not restart the grace period")
+	}
+}
+
+func TestHandshakeSinceSwitch(t *testing.T) {
+	s := NewSupervisor(testConfig(t))
+	if s.handshakeSinceSwitch() {
+		t.Fatal("no tunnel cannot have a handshake")
+	}
+	ft := &fakeTunnel{}
+	s.tun, s.lastSwitch = ft, time.Now()
+	if s.handshakeSinceSwitch() {
+		t.Fatal("zero handshake counted")
+	}
+	// A handshake with the previous endpoint says nothing about the new one.
+	ft.status.LastHandshake = s.lastSwitch.Add(-time.Second)
+	if s.handshakeSinceSwitch() {
+		t.Fatal("handshake from before the switch counted")
+	}
+	ft.status.LastHandshake = s.lastSwitch.Add(time.Second)
+	if !s.handshakeSinceSwitch() {
+		t.Fatal("handshake after the switch not counted")
 	}
 }
 

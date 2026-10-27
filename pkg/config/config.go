@@ -75,7 +75,7 @@ func LoadFromEnv() *Config {
 		HealthHost:               getEnv("HEALTH_HOST", "0.0.0.0"),
 		HealthPort:               getEnvInt("HEALTH_PORT", 8080),
 		DisableHealthServer:      getEnvBool("DISABLE_HEALTH_SERVER", false),
-		ConnectTimeout:           getEnvDuration("CONNECT_TIMEOUT", 60*time.Second),
+		ConnectTimeout:           getEnvDuration("CONNECT_TIMEOUT", 90*time.Second),
 		HealthcheckTimeout:       getEnvDuration("HEALTHCHECK_TIMEOUT", 4*time.Second),
 		LogLevel:                 getEnv("LOG_LEVEL", "info"),
 		RecoveryInterval:         getEnvDuration("RECOVERY_INTERVAL", 30*time.Second),

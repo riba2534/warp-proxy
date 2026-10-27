@@ -17,8 +17,11 @@ independent of traffic), so v2 talks WireGuard to Cloudflare WARP directly.
   HTTP CONNECT on one port (what `warp-svc` accepted), resolves names through
   Cloudflare DNS inside the tunnel and refuses loopback, private, link-local,
   CGNAT and multicast destinations unless `ALLOW_PRIVATE_DESTINATIONS=true`.
-- Rotate Cloudflare endpoints when the handshake goes stale; exit after
-  sustained failures so Docker restarts the container, as before.
+- Rotate Cloudflare endpoints when the handshake goes stale (at startup an
+  endpoint gets 6s to complete a handshake); exit after sustained failures so
+  Docker restarts the container, as before. `CONNECT_TIMEOUT` now defaults to
+  90s so every endpoint candidate gets a turn on networks that block some
+  WireGuard ports.
 - `/status` adds a `tunnel` object (mode, endpoint, last handshake, bytes);
   `warp_status` and `forwarder_stats` keep their names.
 - The image is a static binary on distroless (about 15 MB instead of 1.25 GB).

@@ -50,6 +50,9 @@ func TestConfigLoadDefaults(t *testing.T) {
 	if cfg.DialTimeout != 10*time.Second {
 		t.Errorf("expected DialTimeout 10s, got %v", cfg.DialTimeout)
 	}
+	if cfg.ConnectTimeout != 90*time.Second {
+		t.Errorf("expected ConnectTimeout 90s, got %v", cfg.ConnectTimeout)
+	}
 }
 
 func TestConfigLoadFromEnv(t *testing.T) {

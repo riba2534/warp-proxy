@@ -168,7 +168,7 @@ export ALL_PROXY=socks5h://127.0.0.1:1080
 | `HEALTH_HOST` | `0.0.0.0` | HTTP 健康检查与监控服务的监听地址 |
 | `HEALTH_PORT` | `8080` | HTTP 健康检查与监控服务的端口（设为 `0` 时禁用） |
 | `DISABLE_HEALTH_SERVER` | `false` | 设置为 `true` 时彻底停用 HTTP 监控服务 |
-| `CONNECT_TIMEOUT` | `60s` | 启动预算：注册/加载设备、建隧道并等到首次 trace 成功 |
+| `CONNECT_TIMEOUT` | `90s` | 启动预算：注册/加载设备、建隧道并等到首次 trace 成功；接入点 6 秒内没有握手就换下一个 |
 | `HEALTHCHECK_TIMEOUT` | `4s` | 每次连通性探测的总超时，在多个探测目标间分配 |
 | `RECOVERY_GRACE` | `60s` | 启动后多久开始后台监控 |
 | `RECOVERY_INTERVAL` | `30s` | 后台探测间隔 |

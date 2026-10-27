@@ -23,11 +23,12 @@ import (
 // WireGuard 在有流量（含 25s keepalive）时每 2 分钟重新握手一次。
 const staleHandshake = 3 * time.Minute
 
-// readyPollInterval 是启动阶段等待隧道可用时的探测间隔
-const readyPollInterval = 2 * time.Second
+// readyPollInterval 是启动阶段检查握手与探测的间隔
+const readyPollInterval = time.Second
 
-// switchGrace 是建隧道或切换接入点后，判定"没有握手"之前给首次握手留的时间
-const switchGrace = 10 * time.Second
+// switchGrace 是建隧道或切换接入点后等待首次握手的时间。WireGuard 每 5 秒重发
+// 一次握手发起包，6 秒足够容下一次丢包重试。
+const switchGrace = 6 * time.Second
 
 type tunnelHandle interface {
 	Status() (tunnel.Status, error)
@@ -48,6 +49,7 @@ type Supervisor struct {
 	tunMu      sync.Mutex
 	tun        tunnelHandle
 	lastSwitch time.Time
+	grace      time.Duration // switchGrace; tests shorten it
 
 	// 测试替身：注册、建隧道与连通性探测
 	loadProfile func(ctx context.Context, opts cfwarp.Options) (*cfwarp.Profile, error)
@@ -72,6 +74,7 @@ func NewSupervisor(cfg *config.Config) *Supervisor {
 		ctx:         ctx,
 		cancel:      cancel,
 		failures:    make(chan error, 4),
+		grace:       switchGrace,
 		loadProfile: cfwarp.Load,
 		tunnelUp: func(ctx context.Context, c tunnel.Config) (tunnelHandle, error) {
 			return tunnel.Up(ctx, c)
@@ -160,9 +163,6 @@ func (s *Supervisor) Run() (retErr error) {
 	s.tunMu.Lock()
 	s.tun, s.lastSwitch = t, time.Now()
 	s.tunMu.Unlock()
-	if st, err := t.Status(); err == nil {
-		slog.Info("WireGuard tunnel up", "mode", st.Mode, "interface", st.Interface, "endpoint", st.Endpoint, "ipv6", st.IPv6)
-	}
 
 	if err := s.proxy.Listen(); err != nil {
 		return err
@@ -223,17 +223,20 @@ func (s *Supervisor) tunnelConfig(p *cfwarp.Profile) tunnel.Config {
 	}
 }
 
-// waitReady 等待首个成功的 WARP trace；握手迟迟不来时轮换接入点
+// waitReady 等待首个成功的 WARP trace。当前接入点握手成功后才做 trace 探测；
+// 在 switchGrace 内没有握手就换下一个接入点，不让每个被封的接入点都耗掉一次探测超时。
 func (s *Supervisor) waitReady(ctx context.Context) (*health.Result, error) {
-	var last *health.Result
+	last := &health.Result{Error: "no WireGuard handshake yet"}
 	ticker := time.NewTicker(readyPollInterval)
 	defer ticker.Stop()
 	for {
-		last = s.probe(ctx)
-		if last.Healthy {
-			return last, nil
+		if s.handshakeSinceSwitch() {
+			if last = s.probe(ctx); last.Healthy {
+				return last, nil
+			}
+		} else {
+			s.rotateIfStale("startup")
 		}
-		s.rotateIfStale("startup")
 		select {
 		case <-ctx.Done():
 			if s.ctx.Err() != nil {
@@ -245,12 +248,24 @@ func (s *Supervisor) waitReady(ctx context.Context) (*health.Result, error) {
 	}
 }
 
+// handshakeSinceSwitch 报告当前接入点在建隧道或最近一次切换之后是否完成过握手
+func (s *Supervisor) handshakeSinceSwitch() bool {
+	s.tunMu.Lock()
+	t, since := s.tun, s.lastSwitch
+	s.tunMu.Unlock()
+	if t == nil {
+		return false
+	}
+	st, err := t.Status()
+	return err == nil && st.LastHandshake.After(since)
+}
+
 // rotateIfStale 在没有近期握手时切换到下一个接入点；刚建好或刚切换的接入点先等首次握手
 func (s *Supervisor) rotateIfStale(reason string) {
 	s.tunMu.Lock()
 	t, since := s.tun, time.Since(s.lastSwitch)
 	s.tunMu.Unlock()
-	if t == nil || since < switchGrace {
+	if t == nil || since < s.grace {
 		return
 	}
 	st, err := t.Status()
