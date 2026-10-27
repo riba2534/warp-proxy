@@ -2,53 +2,106 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	"net"
+	"net/netip"
 	"os"
-	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/riba2534/warp-proxy/pkg/cfwarp"
 	"github.com/riba2534/warp-proxy/pkg/config"
-	"github.com/riba2534/warp-proxy/pkg/forwarder"
 	"github.com/riba2534/warp-proxy/pkg/health"
-	"github.com/riba2534/warp-proxy/pkg/warp"
+	"github.com/riba2534/warp-proxy/pkg/proxy"
+	"github.com/riba2534/warp-proxy/pkg/tunnel"
 )
 
-type child struct {
-	cmd  *exec.Cmd
-	done chan struct{}
+// readyPollInterval 是启动阶段检查握手与探测的间隔
+const readyPollInterval = time.Second
+
+// switchGrace 是建隧道或切换接入点后等待首次握手的时间。WireGuard 每 5 秒重发
+// 一次握手发起包，6 秒足够容下一次丢包重试。
+const switchGrace = 6 * time.Second
+
+type tunnelHandle interface {
+	Status() (tunnel.Status, error)
+	RotateEndpoint(ctx context.Context) (string, error)
+	Close() error
 }
 
 type Supervisor struct {
 	cfg       *config.Config
-	warpCtrl  *warp.Controller
-	forwarder *forwarder.Server
+	proxy     *proxy.Server
 	healthSrv *health.Server
 	checker   *health.Checker
 	ctx       context.Context
 	cancel    context.CancelFunc
 	failures  chan error
-	children  []*child
 	workers   sync.WaitGroup
-	ownsDBus  bool
+
+	tunMu sync.Mutex
+	tun   tunnelHandle
+	// switchedAt: when Up or the last rotation started; a later handshake
+	// belongs to the current endpoint. lastSwitch: when it returned; the grace
+	// period starts there, so slow endpoint lookups do not eat into it.
+	switchedAt time.Time
+	lastSwitch time.Time
+	grace      time.Duration // switchGrace; tests shorten it
+
+	// 测试替身：注册、建隧道与连通性探测
+	loadProfile func(ctx context.Context, opts cfwarp.Options) (*cfwarp.Profile, error)
+	tunnelUp    func(ctx context.Context, cfg tunnel.Config) (tunnelHandle, error)
+	probe       func(ctx context.Context) *health.Result
 }
 
 func NewSupervisor(cfg *config.Config) *Supervisor {
 	ctx, cancel := context.WithCancel(context.Background())
-	ctrl := warp.NewController(cfg)
-	fwd := forwarder.NewServer(cfg.ProxyListenAddr(), cfg.WarpSvcTargetAddr())
-	fwd.SetConnectionLimit(cfg.MaxConnections)
+	srv := proxy.NewServer(proxy.Options{
+		ListenAddr:     cfg.ProxyListenAddr(),
+		MaxConnections: cfg.MaxConnections,
+		DialTimeout:    cfg.DialTimeout,
+		DNSServers:     cfg.DNSServers,
+		AllowPrivate:   cfg.AllowPrivateDestinations,
+		// 只有带这个 mark 的套接字（代理的上游连接与 DNS 查询）走隧道
+		Mark: tunnel.DefaultMark,
+	})
 	chk := health.NewChecker(cfg.LocalProxyAddr(), cfg.HealthcheckTimeout)
-	s := &Supervisor{cfg: cfg, warpCtrl: ctrl, forwarder: fwd, checker: chk, ctx: ctx, cancel: cancel, failures: make(chan error, 4)}
+	s := &Supervisor{
+		cfg:         cfg,
+		proxy:       srv,
+		checker:     chk,
+		ctx:         ctx,
+		cancel:      cancel,
+		failures:    make(chan error, 4),
+		grace:       switchGrace,
+		loadProfile: cfwarp.Load,
+		tunnelUp: func(ctx context.Context, c tunnel.Config) (tunnelHandle, error) {
+			return tunnel.Up(ctx, c)
+		},
+	}
+	s.probe = func(ctx context.Context) *health.Result { return s.checker.Check(ctx) }
 	if !cfg.DisableHealthServer && cfg.HealthPort > 0 {
-		s.healthSrv = health.NewServer(cfg.HealthListenAddr(), chk, fwd.GetStats(), ctrl)
+		s.healthSrv = health.NewServer(cfg.HealthListenAddr(), chk, srv.Stats(), s)
 	}
 	return s
+}
+
+// Status 实现 health.TunnelStatusProvider
+func (s *Supervisor) Status() (tunnel.Status, error) {
+	t := s.currentTunnel()
+	if t == nil {
+		return tunnel.Status{}, errors.New("tunnel not started")
+	}
+	return t.Status()
+}
+
+func (s *Supervisor) currentTunnel() tunnelHandle {
+	s.tunMu.Lock()
+	defer s.tunMu.Unlock()
+	return s.tun
 }
 
 func (s *Supervisor) fail(err error) {
@@ -62,8 +115,8 @@ func (s *Supervisor) fail(err error) {
 	s.cancel()
 }
 
-// Run treats child exit and persistent loss of the WARP path as fatal. Docker
-// restarts PID 1; health labels alone never restart a standalone container.
+// Run treats persistent loss of the WARP path as fatal. Docker restarts PID 1;
+// health labels alone never restart a standalone container.
 func (s *Supervisor) Run() (retErr error) {
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer stop()
@@ -90,28 +143,38 @@ func (s *Supervisor) Run() (retErr error) {
 	if err := s.cfg.Validate(); err != nil {
 		return err
 	}
-	if err := s.setupEnvironment(); err != nil {
-		return err
+	if err := os.MkdirAll(s.cfg.DataDir, 0o700); err != nil {
+		return fmt.Errorf("WARP data dir: %w", err)
 	}
-	if err := s.startDBus(); err != nil {
-		return err
+
+	startCtx, cancelStart := context.WithTimeout(s.ctx, s.cfg.ConnectTimeout)
+	defer cancelStart()
+	profile, err := s.loadProfile(startCtx, cfwarp.Options{
+		Path:       s.cfg.RegistrationPath(),
+		LicenseKey: s.cfg.LicenseKey,
+	})
+	if err != nil {
+		return fmt.Errorf("WARP registration: %w", err)
 	}
-	if err := s.startWarpSvc(); err != nil {
-		return err
+	slog.Info("WARP device loaded", "device", profile.DeviceID, "account", profile.AccountType)
+
+	// 握手可能在 Up 返回之前就已完成（内核模式到边缘只要 1ms），所以在调用前记时间
+	started := time.Now()
+	t, err := s.tunnelUp(startCtx, s.tunnelConfig(profile))
+	if err != nil {
+		return fmt.Errorf("WireGuard tunnel: %w", err)
 	}
-	if err := s.warpCtrl.WaitForDaemon(s.ctx, 15*time.Second); err != nil {
-		return fmt.Errorf("WARP daemon readiness: %w", err)
-	}
-	if err := s.warpCtrl.SetupAndConnect(s.ctx); err != nil {
-		return fmt.Errorf("WARP initialization: %w", err)
-	}
-	if err := s.forwarder.Listen(); err != nil {
+	s.tunMu.Lock()
+	s.tun, s.switchedAt, s.lastSwitch = t, started, time.Now()
+	s.tunMu.Unlock()
+
+	if err := s.proxy.Listen(); err != nil {
 		return err
 	}
 	s.workers.Add(1)
 	go func() {
 		defer s.workers.Done()
-		if err := s.forwarder.Serve(); err != nil {
+		if err := s.proxy.Serve(); err != nil {
 			s.fail(err)
 		}
 	}()
@@ -124,88 +187,120 @@ func (s *Supervisor) Run() (retErr error) {
 			}
 		}()
 	}
-	if s.cfg.RecoveryFailures > 0 {
-		s.workers.Add(1)
-		go func() { defer s.workers.Done(); s.monitorHealth() }()
+
+	res, err := s.waitReady(startCtx)
+	if err != nil {
+		return err
 	}
-	slog.Info("WARP proxy ready", "listen", s.cfg.ProxyListenAddr())
+	slog.Info("WARP proxy ready", "listen", s.cfg.ProxyListenAddr(), "warp", res.TraceWarp, "ip", res.ExternalIP, "colo", res.Colo)
+
+	s.workers.Add(1)
+	go func() { defer s.workers.Done(); s.monitorHealth() }()
 	<-s.ctx.Done()
 	return nil
 }
 
-func (s *Supervisor) startChild(name string, cmd *exec.Cmd) error {
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start %s: %w", name, err)
-	}
-	c := &child{cmd: cmd, done: make(chan struct{})}
-	s.children = append(s.children, c)
-	go func() {
-		err := cmd.Wait()
-		close(c.done)
-		s.fail(fmt.Errorf("%s exited unexpectedly: %v", name, err))
-	}()
-	return nil
-}
-
-func (s *Supervisor) setupEnvironment() error {
-	for _, d := range []string{"/var/run/dbus", "/var/lib/cloudflare-warp", "/var/run/cloudflare-warp"} {
-		if err := os.MkdirAll(d, 0755); err != nil {
-			return err
+// tunnelConfig 把注册信息转换成隧道参数；WG_ENDPOINT 覆盖项优先于 Cloudflare 下发的接入点
+func (s *Supervisor) tunnelConfig(p *cfwarp.Profile) tunnel.Config {
+	seen := make(map[string]bool)
+	var endpoints []string
+	for _, ep := range append(append([]string{}, s.cfg.WGEndpoints...), p.Endpoints...) {
+		if !seen[ep] {
+			seen[ep] = true
+			endpoints = append(endpoints, ep)
 		}
 	}
-	ctx, cancel := context.WithTimeout(s.ctx, 3*time.Second)
-	defer cancel()
-	if err := exec.CommandContext(ctx, "dbus-uuidgen", "--ensure").Run(); err != nil {
-		return fmt.Errorf("dbus uuid: %w", err)
+	addrs := []netip.Prefix{p.AddressV4}
+	if p.AddressV6.IsValid() {
+		addrs = append(addrs, p.AddressV6)
 	}
-	return nil
+	return tunnel.Config{
+		Interface:     s.cfg.WGInterface,
+		Mode:          tunnel.Mode(s.cfg.WGMode),
+		PrivateKey:    p.PrivateKey,
+		PeerPublicKey: p.PeerPublicKey,
+		Endpoints:     endpoints,
+		Addresses:     addrs,
+		MTU:           s.cfg.WGMTU,
+		Mark:          tunnel.DefaultMark,
+	}
 }
 
-func socketAlive(path string) bool {
-	c, err := net.DialTimeout("unix", path, 200*time.Millisecond)
-	if err != nil {
+// waitReady 等待首个成功的 WARP trace。当前接入点握手成功后才做 trace 探测；
+// 在 switchGrace 内没有握手就换下一个接入点，不让每个被封的接入点都耗掉一次探测超时。
+func (s *Supervisor) waitReady(ctx context.Context) (*health.Result, error) {
+	last := &health.Result{Error: "no WireGuard handshake yet"}
+	ticker := time.NewTicker(readyPollInterval)
+	defer ticker.Stop()
+	for {
+		if s.handshakeSinceSwitch() {
+			if last = s.probe(ctx); last.Healthy {
+				return last, nil
+			}
+		} else {
+			s.rotate("no handshake at startup")
+		}
+		select {
+		case <-ctx.Done():
+			if s.ctx.Err() != nil {
+				return nil, s.ctx.Err()
+			}
+			return nil, fmt.Errorf("WARP tunnel not usable within %s: %s", s.cfg.ConnectTimeout, last.Error)
+		case <-ticker.C:
+		}
+	}
+}
+
+// sinceSwitch 返回距建隧道或最近一次切换接入点的时间
+func (s *Supervisor) sinceSwitch() time.Duration {
+	s.tunMu.Lock()
+	defer s.tunMu.Unlock()
+	return time.Since(s.lastSwitch)
+}
+
+// handshakeSinceSwitch 报告当前接入点在建隧道或最近一次切换之后是否完成过握手
+func (s *Supervisor) handshakeSinceSwitch() bool {
+	s.tunMu.Lock()
+	t, since := s.tun, s.switchedAt
+	s.tunMu.Unlock()
+	if t == nil {
 		return false
 	}
-	c.Close()
+	st, err := t.Status()
+	return err == nil && st.LastHandshake.After(since)
+}
+
+// rotate 切换到下一个接入点；刚建好或刚切换的接入点先等 grace。报告是否发起了切换。
+// 切换在原地进行，进程与隧道地址不变；换到另一台 Cloudflare 边缘后，已有连接通常会被重置。
+func (s *Supervisor) rotate(reason string) bool {
+	s.tunMu.Lock()
+	t, since := s.tun, time.Since(s.lastSwitch)
+	s.tunMu.Unlock()
+	if t == nil || since < s.grace {
+		return false
+	}
+	from := ""
+	if st, err := t.Status(); err == nil {
+		from = st.Endpoint
+	}
+	started := time.Now()
+	next, err := t.RotateEndpoint(s.ctx)
+	s.tunMu.Lock()
+	s.switchedAt, s.lastSwitch = started, time.Now()
+	s.tunMu.Unlock()
+	if err != nil {
+		slog.Warn("WireGuard endpoint rotation failed", "reason", reason, "error", err)
+		return true
+	}
+	slog.Warn("rotated WireGuard endpoint", "reason", reason, "from", from, "to", next)
 	return true
 }
 
-func (s *Supervisor) startDBus() error {
-	path := "/var/run/dbus/system_bus_socket"
-	if socketAlive(path) {
-		return nil
-	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	_ = os.Remove("/var/run/dbus/pid")
-	if err := s.startChild("dbus-daemon", exec.Command("dbus-daemon", "--system", "--nofork", "--nopidfile")); err != nil {
-		return err
-	}
-	s.ownsDBus = true
-	ctx, cancel := context.WithTimeout(s.ctx, 3*time.Second)
-	defer cancel()
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("D-Bus readiness: %w", ctx.Err())
-		case <-ticker.C:
-			if socketAlive(path) {
-				return nil
-			}
-		}
-	}
-}
-
-func (s *Supervisor) startWarpSvc() error {
-	return s.startChild("warp-svc", exec.Command("warp-svc"))
-}
-
-// Count consecutive failures, allowing the official daemon to reconnect first.
+// monitorHealth probes every RECOVERY_INTERVAL. From the second consecutive
+// failure on it rotates the endpoint in place. With RECOVERY_FAILURES > 0 it
+// exits after that many consecutive failures, but only once a rotation has been
+// tried and the new endpoint had its grace period, so Docker restarts the
+// container; 0 keeps probing and rotating forever.
 func (s *Supervisor) monitorHealth() {
 	timer := time.NewTimer(s.cfg.RecoveryGrace)
 	defer timer.Stop()
@@ -216,15 +311,16 @@ func (s *Supervisor) monitorHealth() {
 	}
 	ticker := time.NewTicker(s.cfg.RecoveryInterval)
 	defer ticker.Stop()
-	failures := 0
+	exitAfter := s.cfg.RecoveryFailures
+	failures, rotated := 0, false
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
-			res := s.checker.Check(s.ctx)
+			res := s.probe(s.ctx)
 			if res.Healthy {
-				failures = 0
+				failures, rotated = 0, false
 				continue
 			}
 			if s.ctx.Err() != nil {
@@ -232,9 +328,14 @@ func (s *Supervisor) monitorHealth() {
 			}
 			failures++
 			slog.Warn("WARP health probe failed", "consecutive", failures, "error", res.Error)
-			if failures >= s.cfg.RecoveryFailures {
+			if exitAfter > 0 && failures >= exitAfter && rotated && s.sinceSwitch() >= s.grace {
 				s.fail(fmt.Errorf("WARP unavailable for %d consecutive probes", failures))
 				return
+			}
+			if failures >= 2 || (exitAfter > 0 && failures >= exitAfter) {
+				if s.rotate("health probe failed") {
+					rotated = true
+				}
 			}
 		}
 	}
@@ -247,32 +348,15 @@ func (s *Supervisor) shutdown() {
 		_ = s.healthSrv.Stop(ctx)
 	}
 	cancel()
-	_ = s.forwarder.Stop()
-	// Terminating warp-svc closes its tunnel; an extra disconnect CLI could block
-	// behind the same unresponsive daemon we are trying to recover.
-	for i := len(s.children) - 1; i >= 0; i-- {
-		terminateChild(s.children[i], 2*time.Second)
-	}
+	_ = s.proxy.Stop()
 	s.workers.Wait()
-	if s.ownsDBus {
-		_ = os.Remove(filepath.Join("/var/run/dbus", "system_bus_socket"))
+	s.tunMu.Lock()
+	t := s.tun
+	s.tun = nil
+	s.tunMu.Unlock()
+	if t != nil {
+		if err := t.Close(); err != nil {
+			slog.Warn("WireGuard tunnel teardown failed", "error", err)
+		}
 	}
-}
-
-func terminateChild(c *child, timeout time.Duration) {
-	select {
-	case <-c.done:
-		return
-	default:
-	}
-	_ = c.cmd.Process.Signal(syscall.SIGTERM)
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-c.done:
-		return
-	case <-timer.C:
-		_ = c.cmd.Process.Kill()
-	}
-	<-c.done
 }
