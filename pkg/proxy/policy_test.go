@@ -8,7 +8,6 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"testing"
 
@@ -83,14 +82,14 @@ func TestPolicyRefusesInternalDestinations(t *testing.T) {
 		"2130706433", "0x7f.1", "127.1", "0177.0.0.1", "0x7f000001", "127.0.0.1.", "0", "[::1]",
 		"localhost", "LOCALHOST.", "foo.localhost", "internal.test", "docker.test", "mapped.test",
 	}
-	resolved := []string{"internal.test", "docker.test", "mapped.test"}
+	resolved := []string{"internal.test.", "docker.test.", "mapped.test."}
 	resolver := &fakeResolver{hosts: map[string][]netip.Addr{
-		"internal.test": addrs("10.0.0.5", "fd00::5"),
-		"docker.test":   addrs("172.18.0.2"),
-		"mapped.test":   addrs("::ffff:192.168.1.1"),
+		"internal.test.": addrs("10.0.0.5", "fd00::5"),
+		"docker.test.":   addrs("172.18.0.2"),
+		"mapped.test.":   addrs("::ffff:192.168.1.1"),
 		// DNS must not be able to turn localhost into something else.
-		"localhost":     addrs("203.0.113.66"),
-		"foo.localhost": addrs("203.0.113.66"),
+		"localhost.":     addrs("203.0.113.66"),
+		"foo.localhost.": addrs("203.0.113.66"),
 	}}
 	var dials recorder
 	s := startServer(t, Options{Dial: redirectTo(startUpstream(t, pong), &dials)}, resolver)
@@ -138,7 +137,7 @@ func TestPolicyRefusesInternalDestinations(t *testing.T) {
 // Only the allowed candidates of a mixed answer are dialed, in resolver order.
 func TestPolicyDialsOnlyAllowedCandidates(t *testing.T) {
 	resolver := &fakeResolver{hosts: map[string][]netip.Addr{
-		"mixed.test": addrs("10.0.0.1", "203.0.113.7", "::1", "2001:db8::8", "192.168.0.9"),
+		"mixed.test.": addrs("10.0.0.1", "203.0.113.7", "::1", "2001:db8::8", "192.168.0.9"),
 	}}
 
 	var dials recorder
@@ -173,7 +172,7 @@ func TestAllowPrivate(t *testing.T) {
 	upstream := startUpstream(t, pong)
 	port := netip.MustParseAddrPort(upstream).Port()
 	resolver := &fakeResolver{hosts: map[string][]netip.Addr{
-		"internal.test": addrs("127.0.0.3", "127.0.0.1"), // nothing listens on .3: refused, then fallback
+		"internal.test.": addrs("127.0.0.3", "127.0.0.1"), // nothing listens on .3: refused, then fallback
 	}}
 	s := startServer(t, Options{AllowPrivate: true, DialTimeout: testTimeout}, resolver)
 	for _, req := range [][]byte{
@@ -260,9 +259,14 @@ func TestParseDNSServer(t *testing.T) {
 
 // TestDNSServers resolves through the configured servers: a refusing one (closed
 // port) and a failing one (SERVFAIL) are passed over within the first lookup,
-// and later lookups start at the server that answered.
+// and later lookups start at the server that answered. Every question is the
+// absolute name the client asked for, never one expanded by resolv.conf's
+// search list (a single-label name would be expanded first under ndots:1).
 func TestDNSServers(t *testing.T) {
-	live := startDNSServer(t, map[string]netip.Addr{"public.test.": netip.MustParseAddr("203.0.113.9")}, dnsmessage.RCodeNameError)
+	live := startDNSServer(t, map[string]netip.Addr{
+		"public.test.": netip.MustParseAddr("203.0.113.9"),
+		"single.":      netip.MustParseAddr("203.0.113.10"),
+	}, dnsmessage.RCodeNameError)
 	failing := startDNSServer(t, nil, dnsmessage.RCodeServerFailure)
 	var dials recorder
 	s := startServer(t, Options{
@@ -276,28 +280,57 @@ func TestDNSServers(t *testing.T) {
 	if got := dials.list(); !slices.Equal(got, []string{"203.0.113.9:80"}) {
 		t.Errorf("dialed %q", got)
 	}
-	if failing.queries.Load() == 0 {
+	if failing.queries() == 0 {
 		t.Error("the failing server was skipped, not tried")
 	}
 
-	failed, answered := failing.queries.Load(), live.queries.Load()
+	failed, answered := failing.queries(), live.queries()
 	mustSOCKS5(t, dialProxy(t, s), socks5Domain("public.test", 80))
-	if failing.queries.Load() != failed || live.queries.Load() == answered {
+	if failing.queries() != failed || live.queries() == answered {
 		t.Error("the second lookup did not start at the server that answered")
 	}
 	c = dialProxy(t, s)
 	if code, _ := socks5Connect(t, c, socks5Domain("missing.test", 80)); code != 0x04 {
 		t.Errorf("unknown name: reply %#x, want 0x04", code)
 	}
-	if failing.queries.Load() != failed {
+	if failing.queries() != failed {
 		t.Error("a name that does not exist moved on to the next server")
+	}
+	mustSOCKS5(t, dialProxy(t, s), socks5Domain("single", 80))
+	asked := slices.Concat(live.questions.list(), failing.questions.list())
+	for _, name := range asked {
+		if !slices.Contains([]string{"public.test.", "missing.test.", "single."}, name) {
+			t.Errorf("DNS was asked for %q", name)
+		}
+	}
+	if !slices.Contains(asked, "single.") {
+		t.Errorf("questions %q lack the single-label name", asked)
+	}
+}
+
+// Hostnames go to the resolver as absolute names, exactly once.
+func TestResolveQueriesAbsoluteNames(t *testing.T) {
+	resolver := &fakeResolver{hosts: map[string][]netip.Addr{
+		"example.test.": addrs("203.0.113.20"), "single.": addrs("203.0.113.21"),
+	}}
+	s := NewServer(Options{})
+	s.lookup = resolver.lookup
+	for _, host := range []string{"example.test", "example.test.", "single"} {
+		if _, err := s.resolve(context.Background(), host); err != nil {
+			t.Errorf("resolve(%q): %v", host, err)
+		}
+	}
+	if got, want := resolver.asked.list(), []string{"example.test.", "example.test.", "single."}; !slices.Equal(got, want) {
+		t.Errorf("resolver asked %q, want %q", got, want)
 	}
 }
 
 type dnsServer struct {
-	addr    string
-	queries atomic.Int64
+	addr      string
+	questions recorder // names asked, as sent on the wire
 }
+
+func (d *dnsServer) queries() int { return len(d.questions.list()) }
 
 // startDNSServer answers A queries for names (FQDNs) and every other query
 // with rcode.
@@ -325,7 +358,7 @@ func startDNSServer(t *testing.T, names map[string]netip.Addr, rcode dnsmessage.
 			if err != nil {
 				continue
 			}
-			srv.queries.Add(1)
+			srv.questions.add(q.Name.String())
 			ip, known := names[q.Name.String()]
 			rh := dnsmessage.Header{ID: h.ID, Response: true, RecursionDesired: h.RecursionDesired, RecursionAvailable: true}
 			if !known {

@@ -270,10 +270,10 @@ func TestProtocolRejections(t *testing.T) {
 	}
 	var dials recorder
 	resolver := &fakeResolver{hosts: map[string][]netip.Addr{
-		"example.test": addrs("203.0.113.20"),
+		"example.test.": addrs("203.0.113.20"),
 		// Malformed names are refused before DNS, whatever it would answer.
-		"":                       addrs("203.0.113.20"),
-		strings.Repeat("a", 256): addrs("203.0.113.20"),
+		".":                            addrs("203.0.113.20"),
+		strings.Repeat("a", 256) + ".": addrs("203.0.113.20"),
 	}}
 	s := startServer(t, Options{Dial: redirectTo(startUpstream(t, pong), &dials)}, resolver)
 	for _, tc := range cases {
@@ -336,7 +336,7 @@ func TestConnectFailureReplies(t *testing.T) {
 				return nil, &net.OpError{Op: "dial", Net: "tcp", Err: ctx.Err()}
 			}
 			resolver := &fakeResolver{errs: map[string]error{
-				"slow.test": &net.DNSError{Err: "i/o timeout", Name: "slow.test", IsTimeout: true},
+				"slow.test.": &net.DNSError{Err: "i/o timeout", Name: "slow.test.", IsTimeout: true},
 			}}
 			s := startServer(t, Options{Dial: dial, DialTimeout: 100 * time.Millisecond}, resolver)
 
@@ -368,7 +368,7 @@ func TestDialFallback(t *testing.T) {
 	refused, unreachable := dialErr(syscall.ECONNREFUSED), dialErr(syscall.EHOSTUNREACH)
 	connect := redirectTo(startUpstream(t, pong), nil)
 	resolver := &fakeResolver{hosts: map[string][]netip.Addr{
-		"multi.test": addrs("203.0.113.1", "2001:db8::2", "203.0.113.3"),
+		"multi.test.": addrs("203.0.113.1", "2001:db8::2", "203.0.113.3"),
 	}}
 	all := []string{"203.0.113.1:80", "[2001:db8::2]:80", "203.0.113.3:80"}
 	cases := []struct {
@@ -416,7 +416,7 @@ func TestDialBudgetIsShared(t *testing.T) {
 		budgets <- time.Until(dl)
 		return nil, dialErr(syscall.ECONNREFUSED)
 	}
-	resolver := &fakeResolver{hosts: map[string][]netip.Addr{"multi.test": addrs("203.0.113.1", "203.0.113.2")}}
+	resolver := &fakeResolver{hosts: map[string][]netip.Addr{"multi.test.": addrs("203.0.113.1", "203.0.113.2")}}
 	s := startServer(t, Options{Dial: dial, DialTimeout: 10 * time.Second}, resolver)
 	c := dialProxy(t, s)
 	if code, _ := socks5Connect(t, c, socks5Domain("multi.test", 80)); code != 0x05 {

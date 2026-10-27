@@ -68,7 +68,8 @@ func addrs(ips ...string) []netip.Addr {
 	return out
 }
 
-var exampleHosts = map[string][]netip.Addr{"example.test": addrs("203.0.113.20")}
+// The server asks DNS for absolute names, so fake tables are keyed by them.
+var exampleHosts = map[string][]netip.Addr{"example.test.": addrs("203.0.113.20")}
 
 // redirectTo returns a Dial hook that records each address in dials (if not
 // nil) and connects it to the loopback target instead, so tests can use public
@@ -93,9 +94,10 @@ func testLogger(t *testing.T) *slog.Logger {
 	return slog.New(slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
-// startServer starts a server on loopback; lookup, when non-nil, replaces DNS.
-// Cleanup stops it and checks that Serve returned nil.
-func startServer(t *testing.T, opts Options, lookup *fakeResolver) *Server {
+// startServer starts a server on loopback; lookup, when non-nil, replaces DNS,
+// and configure runs before the server starts. Cleanup stops it and checks
+// that Serve returned nil.
+func startServer(t *testing.T, opts Options, lookup *fakeResolver, configure ...func(*Server)) *Server {
 	t.Helper()
 	opts.ListenAddr = "127.0.0.1:0"
 	if opts.Logger == nil {
@@ -104,6 +106,9 @@ func startServer(t *testing.T, opts Options, lookup *fakeResolver) *Server {
 	s := NewServer(opts)
 	if lookup != nil {
 		s.lookup = lookup.lookup
+	}
+	for _, f := range configure {
+		f(s)
 	}
 	if err := s.Listen(); err != nil {
 		t.Fatal(err)

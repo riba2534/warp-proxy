@@ -8,13 +8,17 @@ import (
 	"net/netip"
 	"strings"
 	"sync/atomic"
+	"syscall"
 )
 
 type lookupFunc = func(ctx context.Context, host string) ([]netip.Addr, error)
 
+type controlFunc = func(network, address string, c syscall.RawConn) error
+
 // newLookup returns the host lookup for servers ("ip" or "ip:port", default
-// port 53), or the system resolver's when there are none.
-func newLookup(servers []string) (lookupFunc, error) {
+// port 53), whose sockets get control before they connect, or the system
+// resolver's lookup when there are none.
+func newLookup(servers []string, control controlFunc) (lookupFunc, error) {
 	var d dnsServers
 	for _, s := range servers {
 		s = strings.TrimSpace(s)
@@ -25,7 +29,7 @@ func newLookup(servers []string) (lookupFunc, error) {
 		if err != nil {
 			return nil, err
 		}
-		d.resolvers = append(d.resolvers, pinnedResolver(addr))
+		d.resolvers = append(d.resolvers, pinnedResolver(addr, control))
 	}
 	if len(d.resolvers) == 0 {
 		return func(ctx context.Context, host string) ([]netip.Addr, error) {
@@ -48,8 +52,8 @@ func parseDNSServer(s string) (string, error) {
 
 // pinnedResolver is a pure Go resolver that sends every query to addr instead
 // of the servers in /etc/resolv.conf.
-func pinnedResolver(addr string) *net.Resolver {
-	var d net.Dialer
+func pinnedResolver(addr string, control controlFunc) *net.Resolver {
+	d := net.Dialer{Control: control}
 	return &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return d.DialContext(ctx, network, addr)
 	}}
