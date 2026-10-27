@@ -17,6 +17,6 @@ func Up(context.Context, Config) (*Tunnel, error) { return nil, errUnsupported }
 
 func (t *Tunnel) Status() (Status, error) { return Status{}, errUnsupported }
 
-func (t *Tunnel) RotateEndpoint() (string, error) { return "", errUnsupported }
+func (t *Tunnel) RotateEndpoint(context.Context) (string, error) { return "", errUnsupported }
 
 func (t *Tunnel) Close() error { return nil }

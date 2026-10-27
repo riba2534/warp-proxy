@@ -24,7 +24,8 @@ type Tunnel struct {
 
 	// Set by Up, read-only afterwards.
 	mode      Mode
-	ipv6      bool
+	confineV6 bool // marked IPv6 gets our rules and unreachable route
+	ipv6      bool // the tunnel carries IPv6
 	linkIndex int
 	routes    []netlink.Route
 	rules     []netlink.Rule
@@ -60,8 +61,18 @@ func Up(ctx context.Context, cfg Config) (_ *Tunnel, err error) {
 			_ = t.Close()
 		}
 	}()
-	if err := removeStaleLink(cfg.Interface, t.log); err != nil {
+	if err := removeStaleLink(cfg.Interface, private, t.log); err != nil {
 		return nil, err
+	}
+	if err := checkAddressesFree(cfg.Addresses); err != nil {
+		return nil, err
+	}
+	stack := ipv6Stack()
+	if t.confineV6, err = ipv6Confinement(stack, ipv6PolicyRouting(), ipv6Disabled()); err != nil {
+		return nil, err
+	}
+	if stack && !t.confineV6 {
+		t.log.Warn("the kernel has no IPv6 policy routing; IPv6 is disabled here, so it is left alone")
 	}
 	if err := removeStaleRules(cfg.Table, t.log); err != nil {
 		return nil, err
@@ -85,11 +96,6 @@ func Up(ctx context.Context, cfg Config) (_ *Tunnel, err error) {
 		return nil, fmt.Errorf("look up interface %s: %w", cfg.Interface, err)
 	}
 	t.linkIndex = link.Attrs().Index
-	// Kernel links already carry the alias from creation; a TUN cannot, but
-	// it disappears with this process anyway.
-	if err := netlink.LinkSetAlias(link, linkAlias); err != nil {
-		return nil, fmt.Errorf("tag interface %s: %w", cfg.Interface, err)
-	}
 	if err := t.addAddresses(link); err != nil {
 		return nil, err
 	}
@@ -122,7 +128,7 @@ func (t *Tunnel) addAddresses(link netlink.Link) error {
 	if len(v6) == 0 {
 		return nil
 	}
-	if !ipv6Enabled() {
+	if !t.confineV6 || !ipv6Enabled() {
 		t.log.Warn("IPv6 is disabled in this network namespace, tunnel carries IPv4 only")
 		return nil
 	}
@@ -137,13 +143,13 @@ func (t *Tunnel) addAddresses(link netlink.Link) error {
 }
 
 // addRouting sends marked IPv4 through the tunnel, and marked IPv6 through the
-// tunnel or, when the tunnel has no IPv6, into the unreachable route. Without
-// an IPv6 stack there is no IPv6 traffic to confine.
+// tunnel or, when the tunnel has no IPv6, into the unreachable route, unless
+// ipv6Confinement found nothing to confine.
 func (t *Tunnel) addRouting() error {
 	if err := t.routeFamily(netlink.FAMILY_V4, true); err != nil {
 		return err
 	}
-	if !ipv6Stack() {
+	if !t.confineV6 {
 		return nil
 	}
 	return t.routeFamily(netlink.FAMILY_V6, t.ipv6)
@@ -194,8 +200,12 @@ func (t *Tunnel) Status() (Status, error) {
 // RotateEndpoint moves to the next candidate (wrapping) that resolves and
 // replaces the peer with one using it, so a handshake with the new endpoint
 // starts at once; the per-peer counters restart. Link and routing stay as
-// they are. On failure the current endpoint is kept.
-func (t *Tunnel) RotateEndpoint() (string, error) {
+// they are. Hostname resolution ends with ctx (and within 10s anyway); IP
+// literals need none. On failure the current endpoint is kept.
+func (t *Tunnel) RotateEndpoint(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	t.rotateMu.Lock()
 	defer t.rotateMu.Unlock()
 	t.mu.Lock()
@@ -205,7 +215,7 @@ func (t *Tunnel) RotateEndpoint() (string, error) {
 		return "", errClosed
 	}
 
-	idx, ep, err := pickEndpoint(context.Background(), t.cfg.Endpoints, next, t.resolver.resolve)
+	idx, ep, err := pickEndpoint(ctx, t.cfg.Endpoints, next, t.resolver.resolve)
 	if err != nil {
 		return "", err
 	}

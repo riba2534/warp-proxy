@@ -11,10 +11,13 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+	"golang.zx2c4.com/wireguard/wgctrl"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 // Only sockets carrying the mark, and packets sourced from a tunnel address,
@@ -111,7 +114,7 @@ func lockNetns() (io.Closer, error) {
 }
 
 // removeStaleLink deletes a link with our name only if we created it.
-func removeStaleLink(name string, log *slog.Logger) error {
+func removeStaleLink(name string, private wgtypes.Key, log *slog.Logger) error {
 	link, err := netlink.LinkByName(name)
 	if err != nil {
 		if notExist(err) {
@@ -119,9 +122,9 @@ func removeStaleLink(name string, log *slog.Logger) error {
 		}
 		return fmt.Errorf("look up interface %s: %w", name, err)
 	}
-	if alias := link.Attrs().Alias; alias != linkAlias {
+	if !ownLink(link, private, wireguardPrivateKey) {
 		return fmt.Errorf("interface %s already exists and was not created by warp-proxy (%s link, alias %q)",
-			name, link.Type(), alias)
+			name, link.Type(), link.Attrs().Alias)
 	}
 	if err := netlink.LinkDel(link); err != nil && !notExist(err) {
 		return fmt.Errorf("delete stale interface %s: %w", name, err)
@@ -130,10 +133,114 @@ func removeStaleLink(name string, log *slog.Logger) error {
 	return nil
 }
 
-func ipv6Enabled() bool {
-	b, err := os.ReadFile("/proc/sys/net/ipv6/conf/all/disable_ipv6")
-	return err == nil && strings.TrimSpace(string(b)) == "0"
+// ownLink reports whether link is ours: tagged with our alias, or a kernel
+// WireGuard device holding our private key (older builds tagged it only
+// after configuring it, so a crash in between left it untagged).
+func ownLink(link netlink.Link, private wgtypes.Key, deviceKey func(name string) (wgtypes.Key, error)) bool {
+	if link.Attrs().Alias == linkAlias {
+		return true
+	}
+	if link.Type() != "wireguard" {
+		return false
+	}
+	key, err := deviceKey(link.Attrs().Name)
+	return err == nil && key == private
 }
+
+func wireguardPrivateKey(name string) (wgtypes.Key, error) {
+	c, err := wgctrl.New()
+	if err != nil {
+		return wgtypes.Key{}, err
+	}
+	defer c.Close()
+	d, err := c.Device(name)
+	if err != nil {
+		return wgtypes.Key{}, err
+	}
+	return d.PrivateKey, nil
+}
+
+// tagLink marks a link we just created as ours. The kernel ignores
+// IFLA_IFALIAS when creating a link, so this must follow creation at once.
+func tagLink(name string) error {
+	link, err := netlink.LinkByName(name)
+	if err == nil {
+		err = netlink.LinkSetAlias(link, linkAlias)
+	}
+	if err != nil {
+		return fmt.Errorf("tag interface %s: %w", name, err)
+	}
+	return nil
+}
+
+// checkAddressesFree refuses tunnel addresses that are already assigned in
+// this netns: every WARP device gets 172.16.0.2, and our "from" rule would
+// capture the traffic of a host's own WARP tunnel using it.
+func checkAddressesFree(want []netip.Prefix) error {
+	assigned, err := netlink.AddrList(nil, netlink.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("list addresses: %w", err)
+	}
+	a, ok := addressConflict(assigned, want)
+	if !ok {
+		return nil
+	}
+	name := strconv.Itoa(a.LinkIndex)
+	if link, err := netlink.LinkByIndex(a.LinkIndex); err == nil {
+		name = link.Attrs().Name
+	}
+	return fmt.Errorf("tunnel address %s is already assigned to %s in this network namespace, "+
+		"probably another WireGuard tunnel; refusing to capture its traffic", a.IP, name)
+}
+
+func addressConflict(assigned []netlink.Addr, want []netip.Prefix) (netlink.Addr, bool) {
+	for _, a := range assigned {
+		ip, ok := netip.AddrFromSlice(a.IP)
+		if !ok {
+			continue
+		}
+		for _, p := range want {
+			if ip.Unmap() == p.Addr() {
+				return a, true
+			}
+		}
+	}
+	return netlink.Addr{}, false
+}
+
+// ipv6Confinement decides whether marked IPv6 gets our rules and unreachable
+// route. Without IPv6 policy routing (CONFIG_IPV6_MULTIPLE_TABLES=n) a route
+// for our table would land in the main table, and marked IPv6 would leak;
+// that is only acceptable when IPv6 is disabled in the netns.
+func ipv6Confinement(stack, policyRouting, disabled bool) (bool, error) {
+	switch {
+	case !stack:
+		return false, nil
+	case policyRouting:
+		return true, nil
+	case disabled:
+		return false, nil
+	}
+	return false, errors.New("the kernel has no IPv6 policy routing (CONFIG_IPV6_MULTIPLE_TABLES), so marked " +
+		"IPv6 cannot be kept in the tunnel; disable IPv6 in the container with net.ipv6.conf.all.disable_ipv6=1")
+}
+
+// ipv6PolicyRouting reports whether the kernel supports IPv6 rules; tests
+// replace it to simulate a kernel without them.
+var ipv6PolicyRouting = func() bool {
+	_, err := netlink.RuleList(netlink.FAMILY_V6)
+	return !errors.Is(err, unix.EAFNOSUPPORT)
+}
+
+func ipv6Sysctl(iface string) string {
+	b, _ := os.ReadFile("/proc/sys/net/ipv6/conf/" + iface + "/disable_ipv6")
+	return strings.TrimSpace(string(b))
+}
+
+func ipv6Enabled() bool { return ipv6Sysctl("all") == "0" }
+
+// ipv6Disabled reports whether no interface, present or future, has IPv6.
+func ipv6Disabled() bool { return ipv6Sysctl("all") == "1" && ipv6Sysctl("default") == "1" }
 
 // ipv6Stack reports whether this netns can open IPv6 sockets at all, i.e.
 // whether marked IPv6 traffic exists that must be kept out of the main table.

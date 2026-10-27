@@ -76,7 +76,6 @@ func newKernelDevice(p deviceParams) (wgDevice, error) {
 	attrs := netlink.NewLinkAttrs()
 	attrs.Name = p.name
 	attrs.MTU = p.mtu
-	attrs.Alias = linkAlias // set atomically, so a crash never leaves an untagged link
 	if err := netlink.LinkAdd(&netlink.Wireguard{LinkAttrs: attrs}); err != nil {
 		if errors.Is(err, unix.EOPNOTSUPP) {
 			return nil, fmt.Errorf("%w: create %s: %v", errNoKernelWireGuard, p.name, err)
@@ -84,7 +83,10 @@ func newKernelDevice(p deviceParams) (wgDevice, error) {
 		return nil, fmt.Errorf("create WireGuard link %s: %w", p.name, err)
 	}
 	d := &kernelDevice{name: p.name, peerPK: p.peer, keepalive: p.keepalive}
-	err := d.configure(p)
+	err := tagLink(p.name) // before anything else, so a crash rarely leaves an untagged link
+	if err == nil {
+		err = d.configure(p)
+	}
 	if err != nil {
 		_ = d.close()
 		if link, lerr := netlink.LinkByName(p.name); lerr == nil {
@@ -163,6 +165,10 @@ func newUserspaceDevice(p deviceParams, log *slog.Logger) (wgDevice, error) {
 	tdev, err := tun.CreateTUN(p.name, p.mtu)
 	if err != nil {
 		return nil, fmt.Errorf("create TUN %s: %w", p.name, err)
+	}
+	if err := tagLink(p.name); err != nil {
+		tdev.Close()
+		return nil, err
 	}
 	dev := device.NewDevice(tdev, conn.NewDefaultBind(), wireguardLogger(log))
 	d := &userspaceDevice{dev: dev, peerPK: p.peer, keepalive: p.keepalive}
