@@ -14,8 +14,6 @@ services:
     sysctls:
       # 开启容器内 IPv6，使 WARP 的 IPv6 出口可用
       - net.ipv6.conf.all.disable_ipv6=0
-      # 与 wg-quick 一致，配合 fwmark 策略路由通过反向路径过滤
-      - net.ipv4.conf.all.src_valid_mark=1
     # 进程常驻约 10-20 MiB，上限只是兜底
     mem_limit: 128m
     logging:

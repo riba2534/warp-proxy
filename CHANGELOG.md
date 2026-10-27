@@ -10,18 +10,25 @@ independent of traffic), so v2 talks WireGuard to Cloudflare WARP directly.
   fingerprint as in wgcf) and keep it in `wireguard-account.json` (0600) in the
   existing data volume. The cached device config is used when the API is down.
 - Bring up WireGuard inside the container's network namespace: kernel first,
-  `wireguard-go` on `/dev/net/tun` when the kernel lacks the module. wg-quick
-  style fwmark policy routing sends all egress through the tunnel while the
-  container's own subnets keep working.
+  `wireguard-go` on `/dev/net/tun` when the kernel lacks the module. Policy
+  routing (table 22337, mark 0x57415250, interface `warp0`) sends only the
+  proxy's own marked sockets through the tunnel; replies to clients, Docker DNS
+  and WireGuard's own UDP keep the normal routes, strict `rp_filter` hosts work,
+  and a missing tunnel address family is unreachable rather than leaking. Only
+  links and rules tagged as ours are ever cleaned up.
 - Replace the L4 forwarder with a proxy server that speaks SOCKS5, SOCKS4/4a and
   HTTP CONNECT on one port (what `warp-svc` accepted), resolves names through
   Cloudflare DNS inside the tunnel and refuses loopback, private, link-local,
   CGNAT and multicast destinations unless `ALLOW_PRIVATE_DESTINATIONS=true`.
-- Rotate Cloudflare endpoints when the handshake goes stale (at startup an
-  endpoint gets 6s to complete a handshake); exit after sustained failures so
-  Docker restarts the container, as before. `CONNECT_TIMEOUT` now defaults to
-  90s so every endpoint candidate gets a turn on networks that block some
-  WireGuard ports.
+- Rotate Cloudflare endpoints in place (the tunnel address stays, so open
+  connections survive): at startup after 6s without a handshake, later from the
+  second failed probe. Exit after `RECOVERY_FAILURES` consecutive failures, and
+  only once a rotation was tried, so Docker restarts the container as before;
+  `RECOVERY_FAILURES=0` keeps probing and rotating without exiting.
+  `CONNECT_TIMEOUT` now defaults to 90s so every endpoint candidate gets a turn
+  on networks that block some WireGuard ports.
+- A WARP+ license that cannot be applied is logged and the proxy keeps running
+  on the current account, as in v1.
 - `/status` adds a `tunnel` object (mode, endpoint, last handshake, bytes);
   `warp_status` and `forwarder_stats` keep their names.
 - The image is a static binary on distroless (about 15 MB instead of 1.25 GB).
