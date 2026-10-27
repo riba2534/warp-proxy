@@ -1,5 +1,3 @@
-//go:build linux
-
 package tunnel
 
 import (
@@ -12,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
@@ -73,7 +70,7 @@ func (c Config) withDefaults() Config {
 
 // validate expects defaults to be applied already.
 func (c Config) validate() error {
-	if len(c.Interface) >= unix.IFNAMSIZ || c.Interface == "." || c.Interface == ".." ||
+	if len(c.Interface) > 15 || c.Interface == "." || c.Interface == ".." || // IFNAMSIZ-1
 		strings.ContainsAny(c.Interface, "/: \t\n") {
 		return fmt.Errorf("invalid interface name %q", c.Interface)
 	}
@@ -110,7 +107,7 @@ func (c Config) validate() error {
 		return fmt.Errorf("persistent keepalive %v out of range [1s, 65535s]", c.PersistentKeepalive)
 	}
 	switch c.Table {
-	case unix.RT_TABLE_DEFAULT, unix.RT_TABLE_MAIN, unix.RT_TABLE_LOCAL:
+	case 253, 254, 255: // default, main, local
 		return fmt.Errorf("routing table %d is reserved", c.Table)
 	}
 	if c.Table < 0 {
