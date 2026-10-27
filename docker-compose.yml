@@ -1,46 +1,51 @@
-version: "3.8"
-
 services:
   warp-proxy:
-    image: riba2534/warp-proxy:v1.1.0
+    image: riba2534/warp-proxy:v2.0.0
     build:
       context: .
       dockerfile: Dockerfile
     container_name: warp-proxy
     restart: unless-stopped
     stop_grace_period: 10s
+    # 在容器自己的网络命名空间里创建 WireGuard 网卡与策略路由
     cap_add: [NET_ADMIN]
+    # 仅在宿主机内核没有 WireGuard 模块时使用（WG_MODE=auto 会自动回退到用户态 wireguard-go）
     devices: ["/dev/net/tun"]
+    sysctls:
+      # 开启容器内 IPv6，使 WARP 的 IPv6 出口可用
+      - net.ipv6.conf.all.disable_ipv6=0
+      # 与 wg-quick 一致，配合 fwmark 策略路由通过反向路径过滤
+      - net.ipv4.conf.all.src_valid_mark=1
+    # 进程常驻约 10-20 MiB，上限只是兜底
+    mem_limit: 128m
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
     ports:
-      # SOCKS5 代理端口
+      # SOCKS5 / SOCKS4 / HTTP CONNECT 代理端口
       - "127.0.0.1:1080:1080"
       # HTTP 健康检查与指标状态监控端口（可选）
       - "127.0.0.1:8080:8080"
     environment:
       # 外部暴露监听端口（默认 1080）
       - WARP_PROXY_PORT=1080
-      # 内部 warp-svc 监听端口（默认 40000）
-      - WARP_SVC_PORT=40000
       # Cloudflare WARP+ 许可证密钥（可选，普通免费版请留空）
       - WARP_LICENSE_KEY=
+      # WireGuard 运行方式：auto（默认，内核优先）、kernel、userspace
+      - WG_MODE=auto
       # HTTP 健康检查服务端口（设为 0 可关闭 HTTP 探针服务）
       - HEALTH_PORT=8080
-      # WARP 连接等待超时（默认 60s）
-      - CONNECT_TIMEOUT=60s
       # 日志级别 (debug, info, warn, error)
       - LOG_LEVEL=info
     volumes:
-      # 持久化保存 WARP 注册信息和设备凭证，防止容器重建后重复注册
+      # 持久化保存 WARP 注册信息和设备密钥，防止容器重建后重复注册
       - ./warp-data:/var/lib/cloudflare-warp
     # 容器原生健康检查配置
     healthcheck:
       test: ["CMD", "/usr/local/bin/warp-proxy", "-healthcheck"]
       interval: 30s
       timeout: 6s
-      start_period: 90s
+      start_period: 60s
       retries: 3
