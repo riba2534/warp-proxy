@@ -14,7 +14,7 @@ package tunnel
 // Topology, built per test inside that namespace ("client", rp_filter=1):
 //
 //	client netns                              peer netns
-//	wgt-c 10.200.0.1/24 ── veth ─────────── wgt-p 10.200.0.2/24
+//	wgt-c0 10.200.0.1/24 ── veth ────────── wgt-p0 10.200.0.2/24
 //	      198.18.0.1/24                             198.18.0.2/24     (connected, not private)
 //	      2001:db8:1::1/64                          2001:db8:1::2/64
 //	default via 10.200.0.2, 2001:db8:1::2     lo: 203.0.113.1 (WireGuard endpoint), 192.0.2.50 (remote client)
@@ -23,7 +23,7 @@ package tunnel
 //
 // The peer reaches the client's subnet with source 203.0.113.1, so WireGuard
 // answers from the endpoint address and the client never roams to another
-// one. The echo server answers with the source address it saw, which tells
+// one. A second peer netns can serve endpoint 203.0.113.2 (see addPeer). The echo server answers with the source address it saw, which tells
 // whether a connection went through the tunnel (172.16.0.2 / fd00::2) or not.
 
 import (
@@ -124,34 +124,55 @@ func newNetns(t *testing.T) (ns netns.NsHandle) {
 type testbed struct {
 	clientKey wgtypes.Key
 	peerKey   wgtypes.Key
-	peerNs    netns.NsHandle
+	peerNs    netns.NsHandle // peer 0
 }
 
 func newTestbed(t *testing.T) *testbed {
 	requireIsolatedNetns(t)
-	b := &testbed{clientKey: testKey(t), peerKey: testKey(t), peerNs: newNetns(t)}
-	t.Cleanup(func() { b.peerNs.Close() })
-
-	veth := &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "wgt-c"}, PeerName: "wgt-p",
-		PeerNamespace: netlink.NsFd(b.peerNs)}
-	must(t, netlink.LinkAdd(veth))
-	t.Cleanup(func() { _ = netlink.LinkDel(veth) })
+	b := &testbed{clientKey: testKey(t), peerKey: testKey(t)}
 	lo, err := netlink.LinkByName("lo")
 	must(t, err)
 	must(t, netlink.LinkSetUp(lo))
-	must(t, addAddrs(veth, clientVeth4+"/24", clientGUA4+"/24", clientGUA6+"/64"))
-	must(t, netlink.LinkSetUp(veth))
-	must(t, netlink.RouteAdd(&netlink.Route{LinkIndex: veth.Attrs().Index, Gw: net.ParseIP(peerVeth4)}))
-	must(t, netlink.RouteAdd(&netlink.Route{LinkIndex: veth.Attrs().Index, Gw: net.ParseIP(peerGUA6)}))
 	// Strict reverse-path filtering, as on CIS-hardened hosts.
-	for _, iface := range []string{"all", "default", "wgt-c"} {
+	for _, iface := range []string{"all", "default"} {
 		setSysctl(t, "/proc/sys/net/ipv4/conf/"+iface+"/rp_filter", "1")
+	}
+	b.peerNs = b.addPeer(t, 0)
+	return b
+}
+
+// addPeer builds peer n in its own netns behind veth wgt-c<n> (10.200.<n>.0/24)
+// with WireGuard endpoint 203.0.113.<n+1>. Peers share the peer key and serve
+// the same public addresses but no WireGuard sessions, like Cloudflare's
+// endpoints. Peer 0 is the default gateway and also carries the connected
+// non-private subnets.
+func (b *testbed) addPeer(t *testing.T, n int) netns.NsHandle {
+	ns := newNetns(t)
+	t.Cleanup(func() { ns.Close() })
+	veth := &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("wgt-c%d", n)},
+		PeerName: fmt.Sprintf("wgt-p%d", n), PeerNamespace: netlink.NsFd(ns)}
+	must(t, netlink.LinkAdd(veth))
+	t.Cleanup(func() { _ = netlink.LinkDel(veth) })
+	setSysctl(t, "/proc/sys/net/ipv4/conf/"+veth.Name+"/rp_filter", "1")
+	if n == 0 {
+		must(t, addAddrs(veth, clientVeth4+"/24", clientGUA4+"/24", clientGUA6+"/64"))
+	} else {
+		must(t, addAddrs(veth, fmt.Sprintf("10.200.%d.1/24", n)))
+	}
+	must(t, netlink.LinkSetUp(veth))
+	if n == 0 {
+		must(t, netlink.RouteAdd(&netlink.Route{LinkIndex: veth.Attrs().Index, Gw: net.ParseIP(peerVeth4)}))
+		must(t, netlink.RouteAdd(&netlink.Route{LinkIndex: veth.Attrs().Index, Gw: net.ParseIP(peerGUA6)}))
+	} else {
+		must(t, netlink.RouteAdd(&netlink.Route{LinkIndex: veth.Attrs().Index,
+			Dst: ipNet(netip.MustParsePrefix(fmt.Sprintf("203.0.113.%d/32", n+1))),
+			Gw:  net.ParseIP(fmt.Sprintf("10.200.%d.2", n))}))
 	}
 
 	var peerDev *device.Device
 	var echo net.Listener
-	err = inNetns(b.peerNs, func() (err error) {
-		peerDev, echo, err = b.setupPeer()
+	err := inNetns(ns, func() (err error) {
+		peerDev, echo, err = b.setupPeer(n)
 		return err
 	})
 	if peerDev != nil {
@@ -160,34 +181,39 @@ func newTestbed(t *testing.T) *testbed {
 	must(t, err)
 	t.Cleanup(func() { echo.Close() })
 	go serveEcho(echo)
-	return b
+	return ns
 }
 
-// setupPeer runs inside the peer netns, so every socket and link it creates
-// lives there.
-func (b *testbed) setupPeer() (*device.Device, net.Listener, error) {
+// setupPeer runs inside the netns of peer n, so every socket and link it
+// creates lives there.
+func (b *testbed) setupPeer(n int) (*device.Device, net.Listener, error) {
+	endpointIP := fmt.Sprintf("203.0.113.%d", n+1)
 	lo, err := netlink.LinkByName("lo")
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := addAddrs(lo, "203.0.113.1/32", remoteClient+"/32", publicV4+"/32", publicV6+"/128"); err != nil {
+	if err := addAddrs(lo, endpointIP+"/32", remoteClient+"/32", publicV4+"/32", publicV6+"/128"); err != nil {
 		return nil, nil, err
 	}
 	if err := netlink.LinkSetUp(lo); err != nil {
 		return nil, nil, err
 	}
-	veth, err := netlink.LinkByName("wgt-p")
+	veth, err := netlink.LinkByName(fmt.Sprintf("wgt-p%d", n))
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := addAddrs(veth, peerVeth4+"/24", peerGUA4+"/24", peerGUA6+"/64"); err != nil {
+	addrs := []string{fmt.Sprintf("10.200.%d.2/24", n)}
+	if n == 0 {
+		addrs = append(addrs, peerGUA4+"/24", peerGUA6+"/64")
+	}
+	if err := addAddrs(veth, addrs...); err != nil {
 		return nil, nil, err
 	}
 	if err := netlink.LinkSetUp(veth); err != nil {
 		return nil, nil, err
 	}
 	err = netlink.RouteReplace(&netlink.Route{LinkIndex: veth.Attrs().Index, Scope: netlink.SCOPE_LINK,
-		Dst: ipNet(netip.MustParsePrefix("10.200.0.0/24")), Src: net.ParseIP("203.0.113.1")})
+		Dst: ipNet(netip.MustParsePrefix(fmt.Sprintf("10.200.%d.0/24", n))), Src: net.ParseIP(endpointIP)})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -614,6 +640,42 @@ func TestRotateSkipsUnresolvableHostname(t *testing.T) {
 			t.Fatalf("rotate: %q %v", ep, err)
 		}
 		expectSource(t, publicV4, marked, clientInner4)
+	})
+}
+
+func TestRotateStartsFreshHandshake(t *testing.T) {
+	forModes(t, func(t *testing.T, mode Mode) {
+		b := newTestbed(t)
+		b.addPeer(t, 1)
+		endpointB := "203.0.113.2:51820"
+		tn := up(t, b.config(t, mode, endpoint, endpointB))
+		expectSource(t, publicV4, marked, clientInner4)
+
+		// Endpoint A dies: WireGuard's UDP to it is dropped, and strict
+		// rp_filter drops anything still arriving from it.
+		blackhole := &netlink.Route{Type: unix.RTN_BLACKHOLE, Dst: ipNet(netip.MustParsePrefix("203.0.113.1/32"))}
+		must(t, netlink.RouteAdd(blackhole))
+		t.Cleanup(func() { _ = netlink.RouteDel(blackhole) })
+		rotated := time.Now()
+		if ep, err := tn.RotateEndpoint(); err != nil || ep != endpointB {
+			t.Fatalf("rotate: %q %v", ep, err)
+		}
+		// B has never seen A's session: only a new handshake brings traffic back.
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			st, err := tn.Status()
+			must(t, err)
+			if st.LastHandshake.After(rotated) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("no handshake within 3s of rotating: %+v", st)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if got, err := sourceSeenBy(publicV4, marked, 5*time.Second); err != nil || got != clientInner4 {
+			t.Fatalf("traffic after rotating: %q %v", got, err)
+		}
 	})
 }
 

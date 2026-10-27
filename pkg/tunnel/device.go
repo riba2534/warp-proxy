@@ -28,7 +28,11 @@ import (
 type wgDevice interface {
 	// start begins packet processing once the link is up.
 	start() error
-	setEndpoint(netip.AddrPort) error
+	// replacePeer drops the peer, with its session, and adds it back with
+	// endpoint: a session is bound to the endpoint that accepted it, and
+	// WireGuard would otherwise keep using it until it gives up (15s+). The
+	// new peer's persistent keepalive starts a handshake at once.
+	replacePeer(endpoint netip.AddrPort) error
 	peer() (peerStatus, error)
 	close() error
 }
@@ -62,9 +66,10 @@ func createDevice(mode Mode, p deviceParams, log *slog.Logger) (wgDevice, Mode, 
 }
 
 type kernelDevice struct {
-	name   string
-	peerPK wgtypes.Key
-	client *wgctrl.Client
+	name      string
+	peerPK    wgtypes.Key
+	keepalive time.Duration
+	client    *wgctrl.Client
 }
 
 func newKernelDevice(p deviceParams) (wgDevice, error) {
@@ -78,7 +83,7 @@ func newKernelDevice(p deviceParams) (wgDevice, error) {
 		}
 		return nil, fmt.Errorf("create WireGuard link %s: %w", p.name, err)
 	}
-	d := &kernelDevice{name: p.name, peerPK: p.peer}
+	d := &kernelDevice{name: p.name, peerPK: p.peer, keepalive: p.keepalive}
 	err := d.configure(p)
 	if err != nil {
 		_ = d.close()
@@ -94,13 +99,22 @@ func (d *kernelDevice) configure(p deviceParams) (err error) {
 	if d.client, err = wgctrl.New(); err != nil {
 		return fmt.Errorf("open WireGuard netlink: %w", err)
 	}
-	keepalive := p.keepalive
-	err = d.client.ConfigureDevice(d.name, wgtypes.Config{
-		PrivateKey:   &p.private,
+	cfg := d.peerConfig(p.endpoint)
+	cfg.PrivateKey = &p.private
+	if err := d.client.ConfigureDevice(d.name, cfg); err != nil {
+		return fmt.Errorf("configure WireGuard device %s: %w", d.name, err)
+	}
+	return nil
+}
+
+// peerConfig replaces all peers with ours, so it also drops an old session.
+func (d *kernelDevice) peerConfig(endpoint netip.AddrPort) wgtypes.Config {
+	keepalive := d.keepalive
+	return wgtypes.Config{
 		ReplacePeers: true,
 		Peers: []wgtypes.PeerConfig{{
-			PublicKey:                   p.peer,
-			Endpoint:                    net.UDPAddrFromAddrPort(p.endpoint),
+			PublicKey:                   d.peerPK,
+			Endpoint:                    net.UDPAddrFromAddrPort(endpoint),
 			PersistentKeepaliveInterval: &keepalive,
 			ReplaceAllowedIPs:           true,
 			AllowedIPs: []net.IPNet{
@@ -108,21 +122,13 @@ func (d *kernelDevice) configure(p deviceParams) (err error) {
 				*ipNet(netip.PrefixFrom(netip.IPv6Unspecified(), 0)),
 			},
 		}},
-	})
-	if err != nil {
-		return fmt.Errorf("configure WireGuard device %s: %w", d.name, err)
 	}
-	return nil
 }
 
 func (d *kernelDevice) start() error { return nil }
 
-func (d *kernelDevice) setEndpoint(ep netip.AddrPort) error {
-	return d.client.ConfigureDevice(d.name, wgtypes.Config{Peers: []wgtypes.PeerConfig{{
-		PublicKey:  d.peerPK,
-		UpdateOnly: true,
-		Endpoint:   net.UDPAddrFromAddrPort(ep),
-	}}})
+func (d *kernelDevice) replacePeer(ep netip.AddrPort) error {
+	return d.client.ConfigureDevice(d.name, d.peerConfig(ep))
 }
 
 func (d *kernelDevice) peer() (peerStatus, error) {
@@ -148,8 +154,9 @@ func (d *kernelDevice) close() error {
 }
 
 type userspaceDevice struct {
-	dev    *device.Device
-	peerPK wgtypes.Key
+	dev       *device.Device
+	peerPK    wgtypes.Key
+	keepalive time.Duration
 }
 
 func newUserspaceDevice(p deviceParams, log *slog.Logger) (wgDevice, error) {
@@ -158,17 +165,18 @@ func newUserspaceDevice(p deviceParams, log *slog.Logger) (wgDevice, error) {
 		return nil, fmt.Errorf("create TUN %s: %w", p.name, err)
 	}
 	dev := device.NewDevice(tdev, conn.NewDefaultBind(), wireguardLogger(log))
-	if err := dev.IpcSet(uapiConfig(p)); err != nil {
+	d := &userspaceDevice{dev: dev, peerPK: p.peer, keepalive: p.keepalive}
+	if err := dev.IpcSet("private_key=" + hex.EncodeToString(p.private[:]) + "\n" + d.uapiPeer(p.endpoint)); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("configure wireguard-go: %w", err)
 	}
-	return &userspaceDevice{dev: dev, peerPK: p.peer}, nil
+	return d, nil
 }
 
 func (d *userspaceDevice) start() error { return d.dev.Up() }
 
-func (d *userspaceDevice) setEndpoint(ep netip.AddrPort) error {
-	return d.dev.IpcSet(uapiEndpoint(d.peerPK, ep))
+func (d *userspaceDevice) replacePeer(ep netip.AddrPort) error {
+	return d.dev.IpcSet(d.uapiPeer(ep))
 }
 
 func (d *userspaceDevice) peer() (peerStatus, error) {
@@ -194,17 +202,12 @@ func wireguardLogger(log *slog.Logger) *device.Logger {
 	return &device.Logger{Verbosef: logf, Errorf: logf}
 }
 
-// uapiConfig renders the wireguard-go configuration (cross-platform UAPI "set").
-func uapiConfig(p deviceParams) string {
-	return fmt.Sprintf("private_key=%s\nreplace_peers=true\n"+
-		"public_key=%s\nendpoint=%s\npersistent_keepalive_interval=%d\n"+
+// uapiPeer renders a wireguard-go UAPI "set" that replaces all peers with
+// ours, so it also drops an old session.
+func (d *userspaceDevice) uapiPeer(endpoint netip.AddrPort) string {
+	return fmt.Sprintf("replace_peers=true\npublic_key=%s\nendpoint=%s\npersistent_keepalive_interval=%d\n"+
 		"replace_allowed_ips=true\nallowed_ip=0.0.0.0/0\nallowed_ip=::/0\n",
-		hex.EncodeToString(p.private[:]), hex.EncodeToString(p.peer[:]), p.endpoint,
-		int(p.keepalive/time.Second))
-}
-
-func uapiEndpoint(peer wgtypes.Key, ep netip.AddrPort) string {
-	return fmt.Sprintf("public_key=%s\nupdate_only=true\nendpoint=%s\n", hex.EncodeToString(peer[:]), ep)
+		hex.EncodeToString(d.peerPK[:]), endpoint, int(d.keepalive/time.Second))
 }
 
 // parseUAPIPeer extracts the statistics of peer from a UAPI "get" response.
