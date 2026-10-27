@@ -29,13 +29,13 @@ func validConfig(t *testing.T) Config {
 
 func TestConfigDefaults(t *testing.T) {
 	c := Config{}.withDefaults()
-	if c.Interface != "wg0" || c.Mode != ModeAuto || c.MTU != 1280 || c.PersistentKeepalive != 25*time.Second ||
-		c.FwMark != 0xca6c || c.Table != 51820 || c.Logger == nil {
+	if c.Interface != "warp0" || c.Mode != ModeAuto || c.MTU != 1280 || c.PersistentKeepalive != 25*time.Second ||
+		c.Mark != 0x57415250 || c.Table != 22337 || c.Logger == nil {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
-	custom := Config{Interface: "warp", Mode: ModeUserspace, MTU: 1420, PersistentKeepalive: time.Second, FwMark: 7, Table: 100}
+	custom := Config{Interface: "warp", Mode: ModeUserspace, MTU: 1420, PersistentKeepalive: time.Second, Mark: 7, Table: 100}
 	if got := custom.withDefaults(); got.Interface != "warp" || got.Mode != ModeUserspace || got.MTU != 1420 ||
-		got.PersistentKeepalive != time.Second || got.FwMark != 7 || got.Table != 100 {
+		got.PersistentKeepalive != time.Second || got.Mark != 7 || got.Table != 100 {
 		t.Fatalf("explicit values overridden: %+v", got)
 	}
 }

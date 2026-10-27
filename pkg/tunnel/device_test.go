@@ -21,11 +21,10 @@ func TestUAPIConfig(t *testing.T) {
 		private:   private,
 		peer:      peer,
 		endpoint:  netip.MustParseAddrPort("[2606:4700:d0::a29f:c001]:2408"),
-		mark:      0xca6c,
 		keepalive: 25 * time.Second,
 	})
+	// No fwmark: WireGuard's own UDP must keep using the main table.
 	want := "private_key=" + hex.EncodeToString(private[:]) + "\n" +
-		"fwmark=51820\n" +
 		"replace_peers=true\n" +
 		"public_key=" + hex.EncodeToString(peer[:]) + "\n" +
 		"endpoint=[2606:4700:d0::a29f:c001]:2408\n" +

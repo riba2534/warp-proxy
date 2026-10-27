@@ -44,7 +44,6 @@ type deviceParams struct {
 	private   wgtypes.Key
 	peer      wgtypes.Key
 	endpoint  netip.AddrPort
-	mark      uint32
 	keepalive time.Duration
 }
 
@@ -72,6 +71,7 @@ func newKernelDevice(p deviceParams) (wgDevice, error) {
 	attrs := netlink.NewLinkAttrs()
 	attrs.Name = p.name
 	attrs.MTU = p.mtu
+	attrs.Alias = linkAlias // set atomically, so a crash never leaves an untagged link
 	if err := netlink.LinkAdd(&netlink.Wireguard{LinkAttrs: attrs}); err != nil {
 		if errors.Is(err, unix.EOPNOTSUPP) {
 			return nil, fmt.Errorf("%w: create %s: %v", errNoKernelWireGuard, p.name, err)
@@ -94,11 +94,9 @@ func (d *kernelDevice) configure(p deviceParams) (err error) {
 	if d.client, err = wgctrl.New(); err != nil {
 		return fmt.Errorf("open WireGuard netlink: %w", err)
 	}
-	mark := int(p.mark)
 	keepalive := p.keepalive
 	err = d.client.ConfigureDevice(d.name, wgtypes.Config{
 		PrivateKey:   &p.private,
-		FirewallMark: &mark,
 		ReplacePeers: true,
 		Peers: []wgtypes.PeerConfig{{
 			PublicKey:                   p.peer,
@@ -198,10 +196,10 @@ func wireguardLogger(log *slog.Logger) *device.Logger {
 
 // uapiConfig renders the wireguard-go configuration (cross-platform UAPI "set").
 func uapiConfig(p deviceParams) string {
-	return fmt.Sprintf("private_key=%s\nfwmark=%d\nreplace_peers=true\n"+
+	return fmt.Sprintf("private_key=%s\nreplace_peers=true\n"+
 		"public_key=%s\nendpoint=%s\npersistent_keepalive_interval=%d\n"+
 		"replace_allowed_ips=true\nallowed_ip=0.0.0.0/0\nallowed_ip=::/0\n",
-		hex.EncodeToString(p.private[:]), p.mark, hex.EncodeToString(p.peer[:]), p.endpoint,
+		hex.EncodeToString(p.private[:]), hex.EncodeToString(p.peer[:]), p.endpoint,
 		int(p.keepalive/time.Second))
 }
 

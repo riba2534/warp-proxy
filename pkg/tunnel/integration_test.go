@@ -4,23 +4,27 @@ package tunnel
 
 // These tests need root and a throwaway network namespace:
 //
-//	GOTOOLCHAIN=go1.27.1 go test -c -race -tags integration -o /tmp/tunnel/tunnel.test ./pkg/tunnel
+//	go test -c -race -tags integration -o /tmp/tunnel/tunnel.test ./pkg/tunnel
 //	sudo unshare --net /tmp/tunnel/tunnel.test -test.v -test.count=1
 //
 // Each test fails when it finds itself in the init network namespace. Kernel
 // mode subtests skip when the kernel has no WireGuard, unless
 // TUNNEL_REQUIRE_KERNEL_WIREGUARD=1 turns that into a failure (CI).
 //
-// Topology, built per test inside that namespace ("client"):
+// Topology, built per test inside that namespace ("client", rp_filter=1):
 //
 //	client netns                              peer netns
 //	wgt-c 10.200.0.1/24 ── veth ─────────── wgt-p 10.200.0.2/24
-//	default via 10.200.0.2                    lo: 203.0.113.1, 203.0.113.2 (WireGuard endpoints)
-//	wg0 172.16.0.2/32, fd00::2/128  ═ WG ═    wgpeer 172.16.0.1/24, fd00::1/64 (wireguard-go)
-//	                                          lo: 198.51.100.10, 2001:db8::10; echo on :7777 for all
+//	      198.18.0.1/24                             198.18.0.2/24     (connected, not private)
+//	      2001:db8:1::1/64                          2001:db8:1::2/64
+//	default via 10.200.0.2, 2001:db8:1::2     lo: 203.0.113.1 (WireGuard endpoint), 192.0.2.50 (remote client)
+//	warp0 172.16.0.2/32, fd00::2/128 ═ WG ═   wgpeer 172.16.0.1/24, fd00::1/64 (wireguard-go)
+//	                                          lo: 198.51.100.10, 2001:db8::10; echo on :7777
 //
-// The echo server answers with the source address it saw, which tells whether
-// a connection went through the tunnel (172.16.0.2 / fd00::2) or not (10.200.0.1).
+// The peer reaches the client's subnet with source 203.0.113.1, so WireGuard
+// answers from the endpoint address and the client never roams to another
+// one. The echo server answers with the source address it saw, which tells
+// whether a connection went through the tunnel (172.16.0.2 / fd00::2) or not.
 
 import (
 	"context"
@@ -33,8 +37,10 @@ import (
 	"net/netip"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -48,16 +54,24 @@ import (
 )
 
 const (
-	endpointA    = "203.0.113.1:51820"
-	endpointB    = "203.0.113.2:51820"
-	deadEndpoint = "10.200.0.99:51820" // on the veth subnet, nobody there
+	endpoint     = "203.0.113.1:51820"
+	deadEndpoint = "203.0.113.9:51820" // routed to the peer, which drops it
+	unresolvable = "unresolvable.invalid:51820"
 	publicV4     = "198.51.100.10"
 	publicV6     = "2001:db8::10"
-	peerDirect   = "10.200.0.2"
-	clientOuter  = "10.200.0.1"
+	remoteClient = "192.0.2.50"
+	peerVeth4    = "10.200.0.2"
+	clientVeth4  = "10.200.0.1"
+	peerGUA4     = "198.18.0.2"
+	clientGUA4   = "198.18.0.1"
+	peerGUA6     = "2001:db8:1::2"
+	clientGUA6   = "2001:db8:1::1"
 	clientInner4 = "172.16.0.2"
 	clientInner6 = "fd00::2"
 	echoPort     = "7777"
+
+	marked   = DefaultMark
+	unmarked = 0
 )
 
 func requireIsolatedNetns(t *testing.T) {
@@ -110,28 +124,33 @@ func newNetns(t *testing.T) (ns netns.NsHandle) {
 type testbed struct {
 	clientKey wgtypes.Key
 	peerKey   wgtypes.Key
+	peerNs    netns.NsHandle
 }
 
 func newTestbed(t *testing.T) *testbed {
 	requireIsolatedNetns(t)
-	b := &testbed{clientKey: testKey(t), peerKey: testKey(t)}
-	peerNs := newNetns(t)
-	t.Cleanup(func() { peerNs.Close() })
+	b := &testbed{clientKey: testKey(t), peerKey: testKey(t), peerNs: newNetns(t)}
+	t.Cleanup(func() { b.peerNs.Close() })
 
 	veth := &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "wgt-c"}, PeerName: "wgt-p",
-		PeerNamespace: netlink.NsFd(peerNs)}
+		PeerNamespace: netlink.NsFd(b.peerNs)}
 	must(t, netlink.LinkAdd(veth))
 	t.Cleanup(func() { _ = netlink.LinkDel(veth) })
 	lo, err := netlink.LinkByName("lo")
 	must(t, err)
 	must(t, netlink.LinkSetUp(lo))
-	must(t, addAddrs(veth, "10.200.0.1/24"))
+	must(t, addAddrs(veth, clientVeth4+"/24", clientGUA4+"/24", clientGUA6+"/64"))
 	must(t, netlink.LinkSetUp(veth))
-	must(t, netlink.RouteAdd(&netlink.Route{LinkIndex: veth.Attrs().Index, Gw: net.ParseIP(peerDirect)}))
+	must(t, netlink.RouteAdd(&netlink.Route{LinkIndex: veth.Attrs().Index, Gw: net.ParseIP(peerVeth4)}))
+	must(t, netlink.RouteAdd(&netlink.Route{LinkIndex: veth.Attrs().Index, Gw: net.ParseIP(peerGUA6)}))
+	// Strict reverse-path filtering, as on CIS-hardened hosts.
+	for _, iface := range []string{"all", "default", "wgt-c"} {
+		setSysctl(t, "/proc/sys/net/ipv4/conf/"+iface+"/rp_filter", "1")
+	}
 
 	var peerDev *device.Device
 	var echo net.Listener
-	err = inNetns(peerNs, func() (err error) {
+	err = inNetns(b.peerNs, func() (err error) {
 		peerDev, echo, err = b.setupPeer()
 		return err
 	})
@@ -151,7 +170,7 @@ func (b *testbed) setupPeer() (*device.Device, net.Listener, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := addAddrs(lo, "203.0.113.1/32", "203.0.113.2/32", publicV4+"/32", publicV6+"/128"); err != nil {
+	if err := addAddrs(lo, "203.0.113.1/32", remoteClient+"/32", publicV4+"/32", publicV6+"/128"); err != nil {
 		return nil, nil, err
 	}
 	if err := netlink.LinkSetUp(lo); err != nil {
@@ -161,10 +180,15 @@ func (b *testbed) setupPeer() (*device.Device, net.Listener, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := addAddrs(veth, "10.200.0.2/24"); err != nil {
+	if err := addAddrs(veth, peerVeth4+"/24", peerGUA4+"/24", peerGUA6+"/64"); err != nil {
 		return nil, nil, err
 	}
 	if err := netlink.LinkSetUp(veth); err != nil {
+		return nil, nil, err
+	}
+	err = netlink.RouteReplace(&netlink.Route{LinkIndex: veth.Attrs().Index, Scope: netlink.SCOPE_LINK,
+		Dst: ipNet(netip.MustParsePrefix("10.200.0.0/24")), Src: net.ParseIP("203.0.113.1")})
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -232,24 +256,65 @@ func serveEcho(ln net.Listener) {
 	}
 }
 
-// sourceSeenBy connects to the echo server on dst and returns the source
-// address the server saw.
-func sourceSeenBy(dst string, timeout time.Duration) (string, error) {
-	c, err := net.DialTimeout("tcp", net.JoinHostPort(dst, echoPort), timeout)
+// echoReply dials addr and returns what the echo server answered: the
+// source address it saw.
+func echoReply(d net.Dialer, addr string) (string, error) {
+	c, err := d.Dial("tcp", addr)
 	if err != nil {
 		return "", err
 	}
 	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(timeout))
+	_ = c.SetDeadline(time.Now().Add(d.Timeout))
 	b, err := io.ReadAll(c)
 	return string(b), err
 }
 
-func expectSource(t *testing.T, dst, want string) {
+// sourceSeenBy connects to the echo server on dst from a socket carrying mark
+// (0: none) and returns the source address the server saw.
+func sourceSeenBy(dst string, mark uint32, timeout time.Duration) (string, error) {
+	d := net.Dialer{Timeout: timeout}
+	if mark != 0 {
+		d.Control = func(_, _ string, c syscall.RawConn) error {
+			var err error
+			if cerr := c.Control(func(fd uintptr) {
+				err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, int(mark))
+			}); cerr != nil {
+				return cerr
+			}
+			return err
+		}
+	}
+	return echoReply(d, net.JoinHostPort(dst, echoPort))
+}
+
+func expectSource(t *testing.T, dst string, mark uint32, want string) {
 	t.Helper()
-	got, err := sourceSeenBy(dst, 15*time.Second)
+	got, err := sourceSeenBy(dst, mark, 15*time.Second)
 	if err != nil || got != want {
-		t.Fatalf("connection to %s: peer saw %q (err %v), want %s", dst, got, err, want)
+		t.Fatalf("connection to %s (mark %#x): peer saw %q (err %v), want %s", dst, mark, got, err, want)
+	}
+}
+
+func expectUnreachable(t *testing.T, dst string, mark uint32) {
+	t.Helper()
+	got, err := sourceSeenBy(dst, mark, 5*time.Second)
+	if !errors.Is(err, unix.ENETUNREACH) && !errors.Is(err, unix.EHOSTUNREACH) {
+		t.Fatalf("connection to %s (mark %#x): peer saw %q (err %v), want unreachable", dst, mark, got, err)
+	}
+}
+
+// expectRemoteClient checks that a client outside the connected subnets gets
+// replies from a server in the client netns, as proxy clients behind Docker's
+// published ports do.
+func (b *testbed) expectRemoteClient(t *testing.T, server string) {
+	t.Helper()
+	var got string
+	err := inNetns(b.peerNs, func() (err error) {
+		got, err = echoReply(net.Dialer{Timeout: 5 * time.Second, LocalAddr: &net.TCPAddr{IP: net.ParseIP(remoteClient)}}, server)
+		return err
+	})
+	if err != nil || got != remoteClient {
+		t.Fatalf("remote client to %s: got %q (err %v)", server, got, err)
 	}
 }
 
@@ -314,45 +379,64 @@ func forModes(t *testing.T, fn func(t *testing.T, mode Mode)) {
 	})
 }
 
-// ownRules returns the rules this package would treat as its own.
 func ownRules(t *testing.T, family int) []netlink.Rule {
 	t.Helper()
 	rules, err := netlink.RuleList(family)
 	must(t, err)
 	var out []netlink.Rule
 	for _, r := range rules {
-		if staleRule(r, defaultTable, defaultFwMark) {
+		if ownRule(r, DefaultTable) {
 			out = append(out, r)
 		}
 	}
 	return out
 }
 
-func tableRoutes(t *testing.T, family int) []netlink.Route {
+func listTable(t *testing.T, family int) []netlink.Route {
 	t.Helper()
-	routes, err := netlink.RouteListFiltered(family, &netlink.Route{Table: defaultTable}, netlink.RT_FILTER_TABLE)
+	routes, err := netlink.RouteListFiltered(family, &netlink.Route{Table: DefaultTable}, netlink.RT_FILTER_TABLE)
 	must(t, err)
 	return routes
 }
 
+// assertRouting checks the installed rules and tunnel table; v6 says whether
+// the tunnel carries IPv6.
 func assertRouting(t *testing.T, v6 bool) {
 	t.Helper()
 	link, err := netlink.LinkByName(defaultInterface)
 	must(t, err)
-	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		rules, routes := ownRules(t, family), tableRoutes(t, family)
-		if family == netlink.FAMILY_V6 && !v6 {
-			if len(rules) != 0 || len(routes) != 0 {
-				t.Fatalf("IPv6 routing installed while disabled: rules %v routes %v", rules, routes)
-			}
-			continue
+	if link.Attrs().Alias != linkAlias {
+		t.Fatalf("interface alias %q", link.Attrs().Alias)
+	}
+	for _, f := range []struct {
+		family    int
+		from      string
+		viaTunnel bool
+	}{{netlink.FAMILY_V4, clientInner4 + "/32", true}, {netlink.FAMILY_V6, clientInner6 + "/128", v6}} {
+		family, viaTunnel := f.family, f.viaTunnel
+		// Always the mark rule; with the tunnel carrying the family also the from rule.
+		rules := ownRules(t, family)
+		want := 1
+		if viaTunnel {
+			want = 2
 		}
-		if len(rules) != 2 || rules[0].Priority != prioritySuppress || rules[1].Priority != priorityTunnel ||
-			rules[1].Mark != defaultFwMark || !rules[1].Invert || rules[0].SuppressPrefixlen != 0 {
+		if len(rules) != want || rules[0].Priority != priorityMark || rules[0].Mark != DefaultMark ||
+			viaTunnel && (rules[1].Priority != priorityFrom || rules[1].Src.String() != f.from) {
 			t.Fatalf("family %d rules: %v", family, rules)
 		}
-		if len(routes) != 1 || routes[0].LinkIndex != link.Attrs().Index {
-			t.Fatalf("family %d table routes: %v", family, routes)
+		var tunnel, unreachable int
+		for _, r := range listTable(t, family) {
+			switch {
+			case r.Type == unix.RTN_UNREACHABLE:
+				unreachable++
+			case r.LinkIndex == link.Attrs().Index:
+				tunnel++
+			default:
+				t.Fatalf("unexpected route in the tunnel table: %v", r)
+			}
+		}
+		if unreachable != 1 || viaTunnel != (tunnel == 1) {
+			t.Fatalf("family %d table: %d tunnel and %d unreachable routes", family, tunnel, unreachable)
 		}
 	}
 }
@@ -363,147 +447,124 @@ func assertRemoved(t *testing.T) {
 		t.Fatalf("interface still present after Close (err %v)", err)
 	}
 	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		if rules, routes := ownRules(t, family), tableRoutes(t, family); len(rules) != 0 || len(routes) != 0 {
+		if rules, routes := ownRules(t, family), listTable(t, family); len(rules) != 0 || len(routes) != 0 {
 			t.Fatalf("left behind: rules %v routes %v", rules, routes)
 		}
 	}
 }
 
 func TestEndToEnd(t *testing.T) {
-	requireIsolatedNetns(t)
-	kernel := kernelWireGuard(t)
-	auto := ModeUserspace
-	if kernel {
-		auto = ModeKernel
-	}
-	cases := []struct {
-		mode Mode
-		want Mode
-	}{
-		{ModeUserspace, ModeUserspace},
-		{ModeKernel, ModeKernel},
-		{ModeAuto, auto},
-	}
-	for _, tc := range cases {
-		t.Run(string(tc.mode), func(t *testing.T) {
-			if tc.mode == ModeKernel && !kernel {
-				skipWithoutKernelWireGuard(t)
-			}
-			b := newTestbed(t)
-			tn := up(t, b.config(t, tc.mode, endpointA, endpointB))
-			st, err := tn.Status()
-			must(t, err)
-			if st.Mode != tc.want || st.Interface != "wg0" || st.Endpoint != endpointA || !st.IPv6 {
-				t.Fatalf("status after Up: %+v", st)
-			}
-			assertRouting(t, true)
-
-			expectSource(t, publicV4, clientInner4)
-			expectSource(t, publicV6, clientInner6)
-			expectSource(t, peerDirect, clientOuter) // connected subnet bypasses the tunnel
-
-			st, err = tn.Status()
-			must(t, err)
-			if st.LastHandshake.IsZero() || time.Since(st.LastHandshake) > time.Minute || st.RxBytes == 0 || st.TxBytes == 0 {
-				t.Fatalf("no handshake or traffic recorded: %+v", st)
-			}
-			expectSource(t, publicV4, clientInner4)
-			later, err := tn.Status()
-			must(t, err)
-			if later.RxBytes <= st.RxBytes || later.TxBytes <= st.TxBytes {
-				t.Fatalf("counters did not grow: %+v then %+v", st, later)
-			}
-
-			ep, err := tn.RotateEndpoint()
-			if err != nil || ep != endpointB {
-				t.Fatalf("rotate: %q %v", ep, err)
-			}
-			expectSource(t, publicV4, clientInner4)
-			if st, err = tn.Status(); err != nil || st.Endpoint != endpointB {
-				t.Fatalf("status after rotation: %+v %v", st, err)
-			}
-			if ep, err = tn.RotateEndpoint(); err != nil || ep != endpointA {
-				t.Fatalf("rotation did not wrap: %q %v", ep, err)
-			}
-			expectSource(t, publicV4, clientInner4)
-
-			must(t, tn.Close())
-			assertRemoved(t)
-			must(t, tn.Close())
-			if _, err := tn.Status(); err == nil {
-				t.Fatal("Status after Close succeeded")
-			}
-			if _, err := tn.RotateEndpoint(); err == nil {
-				t.Fatal("RotateEndpoint after Close succeeded")
-			}
-			expectSource(t, publicV4, clientOuter) // main table default route again
-		})
-	}
-}
-
-// The handshake after rotating has no cached source address, so it only
-// reaches the peer if WireGuard's UDP carries the fwmark.
-func TestRotateAwayFromDeadEndpoint(t *testing.T) {
 	forModes(t, func(t *testing.T, mode Mode) {
 		b := newTestbed(t)
-		tn := up(t, b.config(t, mode, deadEndpoint, endpointA))
-		if _, err := sourceSeenBy(publicV4, 2*time.Second); err == nil {
-			t.Fatal("traffic flowed through a dead endpoint")
-		}
-		ep, err := tn.RotateEndpoint()
-		if err != nil || ep != endpointA {
-			t.Fatalf("rotate: %q %v", ep, err)
-		}
-		expectSource(t, publicV4, clientInner4)
-	})
-}
-
-func TestUpReplacesStaleState(t *testing.T) {
-	forModes(t, func(t *testing.T, mode Mode) {
-		b := newTestbed(t)
-		stale := &netlink.Tuntap{LinkAttrs: netlink.LinkAttrs{Name: defaultInterface}, Mode: netlink.TUNTAP_MODE_TUN}
-		must(t, netlink.LinkAdd(stale))
-		staleLink, err := netlink.LinkByName(defaultInterface)
+		server, err := net.Listen("tcp", net.JoinHostPort(clientVeth4, "8080"))
 		must(t, err)
-		t.Cleanup(func() { _ = netlink.LinkDel(staleLink) })
-		staleIndex := staleLink.Attrs().Index
-		for i, r := range []netlink.Rule{routingRules(netlink.FAMILY_V4, defaultTable, defaultFwMark)[1],
-			routingRules(netlink.FAMILY_V4, defaultTable, defaultFwMark)[0],
-			routingRules(netlink.FAMILY_V6, defaultTable, defaultFwMark)[1]} {
-			if r.Table == defaultTable {
-				r.Priority = 100 + i // a previous build may have used other priorities
-			}
-			must(t, netlink.RuleAdd(&r))
-		}
+		t.Cleanup(func() { server.Close() })
+		go serveEcho(server)
 
-		tn := up(t, b.config(t, mode, endpointA))
-		if link, err := netlink.LinkByName(defaultInterface); err != nil || link.Attrs().Index == staleIndex {
-			t.Fatalf("stale link not replaced: %v %v", link, err)
+		tn := up(t, b.config(t, mode, endpoint, deadEndpoint))
+		st, err := tn.Status()
+		must(t, err)
+		if st.Mode != mode || st.Interface != defaultInterface || st.Endpoint != endpoint || !st.IPv6 {
+			t.Fatalf("status after Up: %+v", st)
 		}
 		assertRouting(t, true)
-		expectSource(t, publicV4, clientInner4)
+
+		// Only marked sockets use the tunnel, including towards connected
+		// subnets that are not private.
+		expectSource(t, publicV4, marked, clientInner4)
+		expectSource(t, publicV4, unmarked, clientVeth4)
+		expectSource(t, publicV6, marked, clientInner6)
+		expectSource(t, publicV6, unmarked, clientGUA6)
+		expectSource(t, peerGUA4, marked, clientInner4)
+		expectSource(t, peerGUA4, unmarked, clientGUA4)
+		expectSource(t, peerGUA6, marked, clientInner6)
+		b.expectRemoteClient(t, server.Addr().String())
+
+		st, err = tn.Status()
+		must(t, err)
+		if st.LastHandshake.IsZero() || time.Since(st.LastHandshake) > time.Minute || st.RxBytes == 0 || st.TxBytes == 0 {
+			t.Fatalf("no handshake or traffic recorded: %+v", st)
+		}
+		expectSource(t, publicV4, marked, clientInner4)
+		later, err := tn.Status()
+		must(t, err)
+		if later.RxBytes <= st.RxBytes || later.TxBytes <= st.TxBytes {
+			t.Fatalf("counters did not grow: %+v then %+v", st, later)
+		}
+
+		// The peer answers from the endpoint address, and once its last
+		// packets have arrived nothing makes WireGuard roam back, so the
+		// dead endpoint must show.
+		waitQuiet(t, tn)
+		if ep, err := tn.RotateEndpoint(); err != nil || ep != deadEndpoint {
+			t.Fatalf("rotate: %q %v", ep, err)
+		}
+		if _, err := sourceSeenBy(publicV4, marked, 500*time.Millisecond); err == nil {
+			t.Fatal("traffic flowed through a dead endpoint")
+		}
+		if ep, err := tn.RotateEndpoint(); err != nil || ep != endpoint {
+			t.Fatalf("rotation did not wrap: %q %v", ep, err)
+		}
+		expectSource(t, publicV4, marked, clientInner4)
+
 		must(t, tn.Close())
 		assertRemoved(t)
+		must(t, tn.Close())
+		if _, err := tn.Status(); err == nil {
+			t.Fatal("Status after Close succeeded")
+		}
+		if _, err := tn.RotateEndpoint(); err == nil {
+			t.Fatal("RotateEndpoint after Close succeeded")
+		}
+		expectSource(t, publicV4, unmarked, clientVeth4)
 	})
 }
 
-func TestUpKeepsForeignInterface(t *testing.T) {
-	requireIsolatedNetns(t)
+func TestAutoMode(t *testing.T) {
+	want := ModeUserspace
+	if kernelWireGuard(t) {
+		want = ModeKernel
+	}
 	b := newTestbed(t)
-	foreign := &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: defaultInterface}, PeerName: "wg0-peer"}
-	must(t, netlink.LinkAdd(foreign))
-	t.Cleanup(func() { _ = netlink.LinkDel(foreign) })
+	tn := up(t, b.config(t, ModeAuto, endpoint))
+	if st, err := tn.Status(); err != nil || st.Mode != want {
+		t.Fatalf("status: %+v %v, want mode %s", st, err, want)
+	}
+	expectSource(t, publicV4, marked, clientInner4)
+}
 
-	_, err := Up(context.Background(), b.config(t, ModeUserspace, endpointA))
-	if err == nil || !strings.Contains(err.Error(), "already exists") {
-		t.Fatalf("Up over a veth named %s: %v", defaultInterface, err)
+// waitQuiet waits until nothing arrives from the peer any more: any
+// authenticated packet, e.g. the end of a TCP close, makes WireGuard roam.
+func waitQuiet(t *testing.T, tn *Tunnel) {
+	t.Helper()
+	last := int64(-1)
+	for range 20 {
+		st, err := tn.Status()
+		must(t, err)
+		if st.RxBytes == last {
+			return
+		}
+		last = st.RxBytes
+		time.Sleep(250 * time.Millisecond)
 	}
-	if link, err := netlink.LinkByName(defaultInterface); err != nil || link.Type() != "veth" {
-		t.Fatalf("foreign interface touched: %v %v", link, err)
-	}
-	if rules := ownRules(t, netlink.FAMILY_V4); len(rules) != 0 {
-		t.Fatalf("rules installed by a failed Up: %v", rules)
-	}
+	t.Fatal("traffic from the peer did not stop")
+}
+
+func TestMarkedIPv6NeverLeaks(t *testing.T) {
+	forModes(t, func(t *testing.T, mode Mode) {
+		b := newTestbed(t)
+		cfg := b.config(t, mode, endpoint)
+		cfg.Addresses = cfg.Addresses[:1] // the tunnel has no IPv6
+		tn := up(t, cfg)
+		if st, err := tn.Status(); err != nil || st.IPv6 {
+			t.Fatalf("status: %+v %v", st, err)
+		}
+		assertRouting(t, false)
+		expectUnreachable(t, publicV6, marked) // main has an IPv6 default route
+		expectUnreachable(t, peerGUA6, marked) // and a connected IPv6 subnet
+		expectSource(t, publicV6, unmarked, clientGUA6)
+		expectSource(t, publicV4, marked, clientInner4)
+	})
 }
 
 func TestIPv6Disabled(t *testing.T) {
@@ -518,13 +579,13 @@ func TestIPv6Disabled(t *testing.T) {
 				b := newTestbed(t)
 				setSysctl(t, "/proc/sys/net/ipv6/conf/all/disable_ipv6", tc.all)
 				setSysctl(t, "/proc/sys/net/ipv6/conf/default/disable_ipv6", tc.def)
-				tn := up(t, b.config(t, mode, endpointA))
+				tn := up(t, b.config(t, mode, endpoint))
 				st, err := tn.Status()
 				if err != nil || st.IPv6 {
 					t.Fatalf("status: %+v %v", st, err)
 				}
 				assertRouting(t, false)
-				expectSource(t, publicV4, clientInner4)
+				expectSource(t, publicV4, marked, clientInner4)
 				must(t, tn.Close())
 				assertRemoved(t)
 			})
@@ -532,12 +593,151 @@ func TestIPv6Disabled(t *testing.T) {
 	}
 }
 
+func TestRotateSkipsUnresolvableHostname(t *testing.T) {
+	oldTimeout, oldBudget := resolveTimeout, resolveBudget
+	resolveTimeout, resolveBudget = 500*time.Millisecond, 2*time.Second
+	t.Cleanup(func() { resolveTimeout, resolveBudget = oldTimeout, oldBudget })
+	forModes(t, func(t *testing.T, mode Mode) {
+		b := newTestbed(t)
+		// The resolver's queries go out via the main table and are dropped
+		// by the peer, so the hostname candidate times out.
+		tn := up(t, b.config(t, mode, deadEndpoint, unresolvable, endpoint))
+		if _, err := sourceSeenBy(publicV4, marked, 500*time.Millisecond); err == nil {
+			t.Fatal("traffic flowed through a dead endpoint")
+		}
+		start := time.Now()
+		ep, err := tn.RotateEndpoint()
+		if elapsed := time.Since(start); elapsed > resolveBudget+time.Second {
+			t.Fatalf("RotateEndpoint took %v", elapsed)
+		}
+		if err != nil || ep != endpoint {
+			t.Fatalf("rotate: %q %v", ep, err)
+		}
+		expectSource(t, publicV4, marked, clientInner4)
+	})
+}
+
+func TestUpRefusesForeignLink(t *testing.T) {
+	requireIsolatedNetns(t)
+	foreignLinks := map[string]func() netlink.Link{
+		"tun": func() netlink.Link {
+			return &netlink.Tuntap{LinkAttrs: netlink.LinkAttrs{Name: defaultInterface}, Mode: netlink.TUNTAP_MODE_TUN}
+		},
+		"veth": func() netlink.Link {
+			return &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: defaultInterface}, PeerName: "warp0-peer"}
+		},
+		"wireguard": func() netlink.Link {
+			return &netlink.Wireguard{LinkAttrs: netlink.LinkAttrs{Name: defaultInterface}}
+		},
+	}
+	b := &testbed{clientKey: testKey(t), peerKey: testKey(t)} // Up fails before using the topology
+	for name, newLink := range foreignLinks {
+		t.Run(name, func(t *testing.T) {
+			if name == "wireguard" && !kernelWireGuard(t) {
+				skipWithoutKernelWireGuard(t)
+			}
+			must(t, netlink.LinkAdd(newLink()))
+			foreign, err := netlink.LinkByName(defaultInterface)
+			must(t, err)
+			t.Cleanup(func() { _ = netlink.LinkDel(foreign) })
+
+			_, err = Up(context.Background(), b.config(t, ModeAuto, endpoint))
+			if err == nil || !strings.Contains(err.Error(), "not created by warp-proxy") {
+				t.Fatalf("Up over a foreign %s named %s: %v", name, defaultInterface, err)
+			}
+			if link, err := netlink.LinkByName(defaultInterface); err != nil || link.Attrs().Index != foreign.Attrs().Index ||
+				link.Attrs().Alias != "" {
+				t.Fatalf("foreign interface touched: %v %v", link, err)
+			}
+			if rules := ownRules(t, netlink.FAMILY_V4); len(rules) != 0 {
+				t.Fatalf("rules installed by a failed Up: %v", rules)
+			}
+		})
+	}
+}
+
+func TestUpKeepsForeignRulesAndCleansOwnStale(t *testing.T) {
+	forModes(t, func(t *testing.T, mode Mode) {
+		b := newTestbed(t)
+		rule := func(family, priority, table int, mut func(r *netlink.Rule)) netlink.Rule {
+			r := netlink.NewRule()
+			r.Family, r.Priority, r.Table = family, priority, table
+			mut(r)
+			return *r
+		}
+		foreign := []netlink.Rule{
+			// a host's wg-quick, as seen with --network host
+			rule(netlink.FAMILY_V4, 32764, unix.RT_TABLE_MAIN, func(r *netlink.Rule) { r.SuppressPrefixlen = 0 }),
+			rule(netlink.FAMILY_V4, 32765, 51820, func(r *netlink.Rule) { r.Mark, r.Invert = 0xca6c, true }),
+			rule(netlink.FAMILY_V6, 32765, 51820, func(r *netlink.Rule) { r.Mark, r.Invert = 0xca6c, true }),
+			// an untagged rule into our table
+			rule(netlink.FAMILY_V4, 100, DefaultTable, func(r *netlink.Rule) { r.Mark = DefaultMark }),
+		}
+		stale := []netlink.Rule{
+			rule(netlink.FAMILY_V4, 200, DefaultTable, func(r *netlink.Rule) {
+				r.Protocol, r.Src = ownerProtocol, ipNet(netip.MustParsePrefix("10.9.9.9/32"))
+			}),
+			rule(netlink.FAMILY_V6, 201, DefaultTable, func(r *netlink.Rule) { r.Protocol, r.Mark = ownerProtocol, DefaultMark }),
+		}
+		for _, r := range slices.Concat(foreign, stale) {
+			must(t, netlink.RuleAdd(&r))
+		}
+		t.Cleanup(func() {
+			for _, r := range foreign {
+				_ = netlink.RuleDel(&r)
+			}
+		})
+		must(t, netlink.LinkAdd(&netlink.Tuntap{LinkAttrs: netlink.LinkAttrs{Name: defaultInterface}, Mode: netlink.TUNTAP_MODE_TUN}))
+		staleLink, err := netlink.LinkByName(defaultInterface)
+		must(t, err)
+		must(t, netlink.LinkSetAlias(staleLink, linkAlias))
+		t.Cleanup(func() { _ = netlink.LinkDel(staleLink) })
+
+		tn := up(t, b.config(t, mode, endpoint))
+		if link, err := netlink.LinkByName(defaultInterface); err != nil || link.Attrs().Index == staleLink.Attrs().Index {
+			t.Fatalf("stale interface not replaced: %v %v", link, err)
+		}
+		assertRouting(t, true) // exactly our current rules: the stale tagged ones are gone
+		assertForeignRules(t, foreign)
+		expectSource(t, publicV4, marked, clientInner4)
+		must(t, tn.Close())
+		assertRemoved(t)
+		assertForeignRules(t, foreign)
+	})
+}
+
+func assertForeignRules(t *testing.T, want []netlink.Rule) {
+	t.Helper()
+	for _, w := range want {
+		rules, err := netlink.RuleListFiltered(w.Family, &w, netlink.RT_FILTER_PRIORITY|netlink.RT_FILTER_TABLE|netlink.RT_FILTER_MARK)
+		must(t, err)
+		if len(rules) != 1 {
+			t.Fatalf("foreign rule %v: found %v", w, rules)
+		}
+	}
+}
+
+func TestSecondTunnelRefused(t *testing.T) {
+	b := newTestbed(t)
+	first := up(t, b.config(t, ModeUserspace, endpoint))
+	second := b.config(t, ModeUserspace, endpoint)
+	second.Interface = "warp1"
+	if _, err := Up(context.Background(), second); err == nil || !strings.Contains(err.Error(), "another warp-proxy tunnel") {
+		t.Fatalf("second Up in the same netns: %v", err)
+	}
+	assertRouting(t, true) // the first tunnel is untouched
+	expectSource(t, publicV4, marked, clientInner4)
+	must(t, first.Close())
+	up(t, second) // the lock is released by Close
+	expectSource(t, publicV4, marked, clientInner4)
+}
+
 func TestConcurrentUse(t *testing.T) {
 	b := newTestbed(t)
-	cfg := b.config(t, ModeUserspace, endpointA, endpointB)
+	cfg := b.config(t, ModeUserspace, endpoint, deadEndpoint)
 	cfg.Logger = slog.New(slog.DiscardHandler) // one line per rotation otherwise
 	tn := up(t, cfg)
-	expectSource(t, publicV4, clientInner4)
+	expectSource(t, publicV4, marked, clientInner4)
 
 	var wg sync.WaitGroup
 	for range 4 {
@@ -573,10 +773,13 @@ func setSysctl(t *testing.T, path, value string) {
 	t.Cleanup(func() { _ = os.WriteFile(path, old, 0o644) })
 }
 
+// addAddrs adds addresses without duplicate address detection, so IPv6
+// addresses are usable at once.
 func addAddrs(link netlink.Link, prefixes ...string) error {
 	for _, p := range prefixes {
 		addr, err := netlink.ParseAddr(p)
 		if err == nil {
+			addr.Flags = unix.IFA_F_NODAD
 			err = netlink.AddrAdd(link, addr)
 		}
 		if err != nil {

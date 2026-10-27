@@ -5,7 +5,9 @@ package tunnel
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -15,55 +17,67 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Rule priorities sit just before the main table (32766). The suppress rule
-// must be evaluated before the tunnel rule so that directly connected subnets
-// and other specific main-table routes bypass the tunnel.
+// Only sockets carrying the mark, and packets sourced from a tunnel address,
+// use the tunnel table; everything else in the netns keeps the main table.
+// Both rules sit before the main table rule (32766).
 const (
-	prioritySuppress = 32764 // lookup main suppress_prefixlength 0
-	priorityTunnel   = 32765 // not fwmark FwMark lookup Table
+	priorityMark = 32760 // fwmark Mark lookup Table
+	priorityFrom = 32761 // from <tunnel address> lookup Table
+
+	// ownerProtocol tags the rules and routes we add (unassigned in rt_protos).
+	ownerProtocol = 87
+	// linkAlias marks the links we create; nothing else is ever deleted.
+	linkAlias = "warp-proxy"
 )
 
-// routingRules returns the wg-quick style policy rules for one address family,
-// in the order they must be installed.
-func routingRules(family int, table int, mark uint32) []netlink.Rule {
-	suppress := netlink.NewRule()
-	suppress.Family = family
-	suppress.Priority = prioritySuppress
-	suppress.Table = unix.RT_TABLE_MAIN
-	suppress.SuppressPrefixlen = 0
-
-	tunnel := netlink.NewRule()
-	tunnel.Family = family
-	tunnel.Priority = priorityTunnel
-	tunnel.Table = table
-	tunnel.Mark = mark
-	tunnel.Invert = true
-	return []netlink.Rule{*suppress, *tunnel}
+// routingRules returns the policy rules for one address family. The "from"
+// rules route kernel-generated packets of tunnel flows and let strict
+// reverse-path filtering accept decrypted packets arriving on the tunnel.
+func routingRules(family, table int, mark uint32, addrs []netip.Prefix) []netlink.Rule {
+	rule := func(priority int) netlink.Rule {
+		r := netlink.NewRule()
+		r.Family, r.Table, r.Priority, r.Protocol = family, table, priority, ownerProtocol
+		return *r
+	}
+	marked := rule(priorityMark)
+	marked.Mark = mark
+	rules := []netlink.Rule{marked}
+	for _, p := range addrs {
+		if p.Addr().Is4() != (family == netlink.FAMILY_V4) {
+			continue
+		}
+		from := rule(priorityFrom)
+		from.Src = ipNet(netip.PrefixFrom(p.Addr(), p.Addr().BitLen()))
+		rules = append(rules, from)
+	}
+	return rules
 }
 
-// defaultRoute returns the default route via the tunnel link in table.
-func defaultRoute(family, linkIndex, table int) netlink.Route {
+// tableRoutes returns the routes of the tunnel table for one family: the
+// tunnel when it carries the family, and always an unreachable default with
+// the highest metric so marked traffic can never fall through to the main table.
+func tableRoutes(family, table, linkIndex int, viaTunnel bool) []netlink.Route {
 	dst := netip.PrefixFrom(netip.IPv4Unspecified(), 0)
 	if family == netlink.FAMILY_V6 {
 		dst = netip.PrefixFrom(netip.IPv6Unspecified(), 0)
 	}
-	return netlink.Route{
-		Family:    family,
-		LinkIndex: linkIndex,
-		Dst:       ipNet(dst),
-		Table:     table,
-		Scope:     netlink.SCOPE_LINK,
+	base := netlink.Route{Family: family, Dst: ipNet(dst), Table: table, Protocol: ownerProtocol}
+	unreachable := base
+	unreachable.Type, unreachable.Priority = unix.RTN_UNREACHABLE, math.MaxInt32
+	if !viaTunnel {
+		return []netlink.Route{unreachable}
 	}
+	tunnel := base
+	tunnel.LinkIndex, tunnel.Scope = linkIndex, netlink.SCOPE_LINK
+	return []netlink.Route{tunnel, unreachable}
 }
 
-// staleRule reports whether r looks like a rule a previous Up left behind.
-func staleRule(r netlink.Rule, table int, mark uint32) bool {
-	return r.Table == table ||
-		(r.Invert && r.Mark == mark) ||
-		(r.Table == unix.RT_TABLE_MAIN && r.SuppressPrefixlen == 0 && r.Priority == prioritySuppress)
+// ownRule reports whether r was added by this package for table.
+func ownRule(r netlink.Rule, table int) bool {
+	return r.Protocol == ownerProtocol && r.Table == table
 }
 
-func removeStaleRules(table int, mark uint32, log *slog.Logger) error {
+func removeStaleRules(table int, log *slog.Logger) error {
 	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
 		rules, err := netlink.RuleList(family)
 		if err != nil {
@@ -73,7 +87,7 @@ func removeStaleRules(table int, mark uint32, log *slog.Logger) error {
 			return fmt.Errorf("list routing rules: %w", err)
 		}
 		for _, r := range rules {
-			if !staleRule(r, table, mark) {
+			if !ownRule(r, table) {
 				continue
 			}
 			if err := netlink.RuleDel(&r); err != nil && !notExist(err) {
@@ -85,8 +99,18 @@ func removeStaleRules(table int, mark uint32, log *slog.Logger) error {
 	return nil
 }
 
-// removeStaleLink deletes a WireGuard or TUN link with our name. Any other
-// link type is left alone: the name is then most likely a configuration error.
+// lockNetns allows one tunnel per network namespace. Abstract unix sockets
+// belong to the netns and are released when their process dies, so objects
+// tagged as ours that exist while we hold the lock are stale.
+func lockNetns() (io.Closer, error) {
+	c, err := net.ListenPacket("unixgram", "@warp-proxy-tunnel")
+	if errors.Is(err, unix.EADDRINUSE) {
+		return nil, errors.New("another warp-proxy tunnel is running in this network namespace")
+	}
+	return c, err
+}
+
+// removeStaleLink deletes a link with our name only if we created it.
 func removeStaleLink(name string, log *slog.Logger) error {
 	link, err := netlink.LinkByName(name)
 	if err != nil {
@@ -95,8 +119,9 @@ func removeStaleLink(name string, log *slog.Logger) error {
 		}
 		return fmt.Errorf("look up interface %s: %w", name, err)
 	}
-	if t := link.Type(); t != "wireguard" && t != "tuntap" {
-		return fmt.Errorf("interface %s already exists as a %s link", name, t)
+	if alias := link.Attrs().Alias; alias != linkAlias {
+		return fmt.Errorf("interface %s already exists and was not created by warp-proxy (%s link, alias %q)",
+			name, link.Type(), alias)
 	}
 	if err := netlink.LinkDel(link); err != nil && !notExist(err) {
 		return fmt.Errorf("delete stale interface %s: %w", name, err)
@@ -110,12 +135,15 @@ func ipv6Enabled() bool {
 	return err == nil && strings.TrimSpace(string(b)) == "0"
 }
 
-// enableSrcValidMark lets reverse-path filtering see WireGuard's fwmark, as
-// wg-quick does. /proc/sys is often read-only in containers, so it is optional.
-func enableSrcValidMark(log *slog.Logger) {
-	if err := os.WriteFile("/proc/sys/net/ipv4/conf/all/src_valid_mark", []byte("1"), 0o644); err != nil {
-		log.Debug("cannot set net.ipv4.conf.all.src_valid_mark", "error", err)
+// ipv6Stack reports whether this netns can open IPv6 sockets at all, i.e.
+// whether marked IPv6 traffic exists that must be kept out of the main table.
+func ipv6Stack() bool {
+	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return !errors.Is(err, unix.EAFNOSUPPORT)
 	}
+	unix.Close(fd)
+	return true
 }
 
 func notExist(err error) bool {

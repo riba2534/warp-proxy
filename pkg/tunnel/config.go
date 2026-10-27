@@ -22,7 +22,7 @@ const (
 )
 
 type Config struct {
-	Interface           string         // default "wg0"
+	Interface           string         // default "warp0"
 	Mode                Mode           // default ModeAuto
 	PrivateKey          string         // base64
 	PeerPublicKey       string         // base64
@@ -30,17 +30,22 @@ type Config struct {
 	Addresses           []netip.Prefix // v4 and optionally v6
 	MTU                 int            // default 1280
 	PersistentKeepalive time.Duration  // default 25s
-	FwMark              uint32         // default 0xca6c
-	Table               int            // default 51820
+	Mark                uint32         // sockets carrying this mark are routed through the tunnel; default DefaultMark
+	Table               int            // default DefaultTable
 	Logger              *slog.Logger
 }
 
+// Defaults distinct from wg-quick's 0xca6c/51820, so a host's own WireGuard is
+// never mistaken for ours.
 const (
-	defaultInterface = "wg0"
+	DefaultMark  uint32 = 0x57415250 // "WARP"
+	DefaultTable        = 22337      // 0x5741
+)
+
+const (
+	defaultInterface = "warp0"
 	defaultMTU       = 1280
 	defaultKeepalive = 25 * time.Second
-	defaultFwMark    = 0xca6c
-	defaultTable     = 51820
 )
 
 func (c Config) withDefaults() Config {
@@ -56,11 +61,11 @@ func (c Config) withDefaults() Config {
 	if c.PersistentKeepalive == 0 {
 		c.PersistentKeepalive = defaultKeepalive
 	}
-	if c.FwMark == 0 {
-		c.FwMark = defaultFwMark
+	if c.Mark == 0 {
+		c.Mark = DefaultMark
 	}
 	if c.Table == 0 {
-		c.Table = defaultTable
+		c.Table = DefaultTable
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()

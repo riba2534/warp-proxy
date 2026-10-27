@@ -3,6 +3,8 @@
 package tunnel
 
 import (
+	"math"
+	"net/netip"
 	"testing"
 
 	"github.com/vishvananda/netlink"
@@ -10,81 +12,82 @@ import (
 )
 
 func TestRoutingRules(t *testing.T) {
-	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		rules := routingRules(family, 51820, 0xca6c)
-		if len(rules) != 2 {
-			t.Fatalf("got %d rules", len(rules))
+	addrs := []netip.Prefix{netip.MustParsePrefix("172.16.0.2/32"), netip.MustParsePrefix("2606:4700:110::2/64")}
+	cases := []struct {
+		family int
+		addrs  []netip.Prefix
+		from   []string
+	}{
+		{netlink.FAMILY_V4, addrs, []string{"172.16.0.2/32"}},
+		{netlink.FAMILY_V6, addrs, []string{"2606:4700:110::2/128"}}, // the host address, not its prefix
+		{netlink.FAMILY_V6, nil, nil},                                // tunnel without IPv6: mark rule only
+	}
+	for _, tc := range cases {
+		rules := routingRules(tc.family, 22337, 0x57415250, tc.addrs)
+		if len(rules) != 1+len(tc.from) {
+			t.Fatalf("family %d: got %d rules", tc.family, len(rules))
 		}
-		suppress, tunnel := rules[0], rules[1]
-		if suppress.Family != family || suppress.Table != unix.RT_TABLE_MAIN || suppress.SuppressPrefixlen != 0 ||
-			suppress.Invert || suppress.Mark != 0 {
-			t.Fatalf("suppress rule: %+v", suppress)
+		marked := rules[0]
+		if marked.Priority != priorityMark || marked.Mark != 0x57415250 || marked.Mask != nil || marked.Src != nil || marked.Invert {
+			t.Fatalf("mark rule: %+v", marked)
 		}
-		if tunnel.Family != family || tunnel.Table != 51820 || tunnel.Mark != 0xca6c || !tunnel.Invert ||
-			tunnel.SuppressPrefixlen != -1 {
-			t.Fatalf("tunnel rule: %+v", tunnel)
+		for i, want := range tc.from {
+			from := rules[1+i]
+			if from.Priority != priorityFrom || from.Mark != 0 || from.Src.String() != want {
+				t.Fatalf("from rule: %+v, want from %s", from, want)
+			}
 		}
-		// Connected subnets must be looked up before traffic is sent into the
-		// tunnel, and both before the main table rule at 32766.
-		if !(suppress.Priority < tunnel.Priority && tunnel.Priority < 32766 && suppress.Priority > 0) {
-			t.Fatalf("priorities %d, %d", suppress.Priority, tunnel.Priority)
-		}
-		// netlink.Rule zero values mean "goto 0" and "flow 0"; the rules must come from NewRule.
 		for _, r := range rules {
-			if r.Goto != -1 || r.Flow != -1 || r.SuppressIfgroup != -1 || r.Mask != nil {
+			if r.Family != tc.family || r.Table != 22337 || r.Protocol != ownerProtocol {
+				t.Fatalf("rule not ours or wrong family: %+v", r)
+			}
+			// netlink.Rule zero values mean "goto 0" and "flow 0"; the rules must come from NewRule.
+			if r.Goto != -1 || r.Flow != -1 || r.SuppressIfgroup != -1 || r.SuppressPrefixlen != -1 {
 				t.Fatalf("rule carries unintended attributes: %+v", r)
 			}
 		}
 	}
-}
-
-func TestDefaultRoute(t *testing.T) {
-	v4 := defaultRoute(netlink.FAMILY_V4, 7, 51820)
-	if v4.Dst.String() != "0.0.0.0/0" || v4.LinkIndex != 7 || v4.Table != 51820 || v4.Family != netlink.FAMILY_V4 ||
-		v4.Scope != netlink.SCOPE_LINK || v4.Gw != nil {
-		t.Fatalf("v4 route: %+v", v4)
-	}
-	v6 := defaultRoute(netlink.FAMILY_V6, 7, 51820)
-	if v6.Dst.String() != "::/0" || v6.LinkIndex != 7 || v6.Table != 51820 || v6.Family != netlink.FAMILY_V6 {
-		t.Fatalf("v6 route: %+v", v6)
+	if !(priorityMark < priorityFrom && priorityFrom < 32766) {
+		t.Fatal("rules must be evaluated before the main table")
 	}
 }
 
-func TestStaleRule(t *testing.T) {
-	ours := routingRules(netlink.FAMILY_V4, 51820, 0xca6c)
-	for _, r := range ours {
-		if !staleRule(r, 51820, 0xca6c) {
+func TestTableRoutes(t *testing.T) {
+	for _, tc := range []struct {
+		family  int
+		wantDst string
+	}{{netlink.FAMILY_V4, "0.0.0.0/0"}, {netlink.FAMILY_V6, "::/0"}} {
+		family, wantDst := tc.family, tc.wantDst
+		routes := tableRoutes(family, 22337, 7, true)
+		if len(routes) != 2 {
+			t.Fatalf("got %d routes", len(routes))
+		}
+		tunnel, unreachable := routes[0], routes[1]
+		if tunnel.Dst.String() != wantDst || tunnel.LinkIndex != 7 || tunnel.Table != 22337 || tunnel.Family != family ||
+			tunnel.Type != 0 || tunnel.Gw != nil || tunnel.Protocol != ownerProtocol {
+			t.Fatalf("tunnel route: %+v", tunnel)
+		}
+		if unreachable.Dst.String() != wantDst || unreachable.Type != unix.RTN_UNREACHABLE || unreachable.LinkIndex != 0 ||
+			unreachable.Table != 22337 || unreachable.Priority != math.MaxInt32 || unreachable.Protocol != ownerProtocol {
+			t.Fatalf("unreachable route: %+v", unreachable)
+		}
+		if only := tableRoutes(family, 22337, 7, false); len(only) != 1 || only[0].Type != unix.RTN_UNREACHABLE {
+			t.Fatalf("without the tunnel only the unreachable route remains: %+v", only)
+		}
+	}
+}
+
+func TestOwnRule(t *testing.T) {
+	rules := routingRules(netlink.FAMILY_V4, 22337, 0x57415250, []netip.Prefix{netip.MustParsePrefix("172.16.0.2/32")})
+	for _, r := range rules {
+		if !ownRule(r, 22337) {
 			t.Fatalf("own rule not recognised: %+v", r)
 		}
 	}
-	movedTunnel := ours[1]
-	movedTunnel.Priority = 100
-	if !staleRule(movedTunnel, 51820, 0xca6c) {
-		t.Fatal("tunnel rule at another priority not recognised")
-	}
-	foreignMark := netlink.NewRule()
-	foreignMark.Mark, foreignMark.Invert, foreignMark.Table, foreignMark.Priority = 0xca6c, true, 200, 50
-	if !staleRule(*foreignMark, 51820, 0xca6c) {
-		t.Fatal("rule matching not-fwmark not recognised")
-	}
-
-	keep := []netlink.Rule{}
-	for _, mut := range []func(r *netlink.Rule){
-		func(r *netlink.Rule) { r.Priority, r.Table = 0, unix.RT_TABLE_LOCAL },
-		func(r *netlink.Rule) { r.Priority, r.Table = 32766, unix.RT_TABLE_MAIN },
-		func(r *netlink.Rule) { r.Priority, r.Table = 32767, unix.RT_TABLE_DEFAULT },
-		// someone else's suppress rule at another priority
-		func(r *netlink.Rule) { r.Priority, r.Table, r.SuppressPrefixlen = 1000, unix.RT_TABLE_MAIN, 0 },
-		// matching mark that is not inverted
-		func(r *netlink.Rule) { r.Priority, r.Table, r.Mark = 1001, 300, 0xca6c },
-	} {
-		r := netlink.NewRule()
-		mut(r)
-		keep = append(keep, *r)
-	}
-	for _, r := range keep {
-		if staleRule(r, 51820, 0xca6c) {
-			t.Fatalf("unrelated rule treated as stale: %+v", r)
-		}
+	untagged, otherTable := rules[0], rules[0]
+	untagged.Protocol = 0
+	otherTable.Table = 51820
+	if ownRule(untagged, 22337) || ownRule(otherTable, 22337) {
+		t.Fatal("a rule must carry our tag and our table to be ours")
 	}
 }
