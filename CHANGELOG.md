@@ -20,10 +20,12 @@ independent of traffic), so v2 talks WireGuard to Cloudflare WARP directly.
   HTTP CONNECT on one port (what `warp-svc` accepted), resolves names through
   Cloudflare DNS inside the tunnel and refuses loopback, private, link-local,
   CGNAT and multicast destinations unless `ALLOW_PRIVATE_DESTINATIONS=true`.
-- Rotate Cloudflare endpoints in place (the tunnel address stays, so open
-  connections survive): at startup after 6s without a handshake, later from the
-  second failed probe. Exit after `RECOVERY_FAILURES` consecutive failures, and
-  only once a rotation was tried, so Docker restarts the container as before;
+- Rotate Cloudflare endpoints in place, with a fresh handshake: at startup
+  after 6s without a handshake, later from the second failed probe. Open
+  connections are usually reset when the traffic moves to another Cloudflare
+  edge, but the process and the tunnel stay up. Exit after `RECOVERY_FAILURES`
+  consecutive failures, and only once a rotation was tried and given its 6s,
+  so Docker restarts the container as before;
   `RECOVERY_FAILURES=0` keeps probing and rotating without exiting.
   `CONNECT_TIMEOUT` now defaults to 90s so every endpoint candidate gets a turn
   on networks that block some WireGuard ports.

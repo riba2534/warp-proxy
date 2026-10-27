@@ -335,6 +335,31 @@ func TestRecoveryDisabledKeepsRotating(t *testing.T) {
 	}
 }
 
+func TestRecoveryWaitsForRotatedEndpoint(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.RecoveryGrace = 0
+	cfg.RecoveryInterval = 10 * time.Millisecond
+	cfg.RecoveryFailures = 2
+	s := NewSupervisor(cfg)
+	t.Cleanup(s.shutdown)
+	s.grace = 300 * time.Millisecond
+	ft := &fakeTunnel{}
+	s.tun, s.lastSwitch = ft, time.Now().Add(-time.Hour)
+	s.probe = func(context.Context) *health.Result { return &health.Result{Error: "trace failed"} }
+	start := time.Now()
+	go s.monitorHealth()
+	select {
+	case <-s.failures:
+		// The rotation happens at the second probe (~20ms); exiting before the
+		// new endpoint had its grace would give up on it untried.
+		if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
+			t.Fatalf("exited %v after start, before the rotated endpoint's grace", elapsed)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no exit")
+	}
+}
+
 func TestRecoveryStreakResetsAfterSuccess(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.RecoveryGrace = 0

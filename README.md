@@ -45,7 +45,7 @@ v2 起不再运行 Cloudflare 官方的 `warp-svc`。官方客户端的本地代
 | **代理入口** | 默认监听 `0.0.0.0:1080`，同一端口自动识别 SOCKS5（RFC 1928，无认证 CONNECT）、SOCKS4/4a 与 HTTP CONNECT；`socks5h://` 域名请求经隧道内的 Cloudflare DNS 解析 |
 | **WireGuard 隧道** | 自动注册 WARP 设备，内核 WireGuard 优先，缺少内核模块时回退到 `/dev/net/tun` 上的 `wireguard-go`；策略路由只把代理带 mark 的连接送进隧道，隧道缺少某个地址族时该族直接不可达，不会绕过隧道 |
 | **出站安全策略** | 默认拒绝回环、私有网段（RFC 1918 / ULA）、链路本地、CGNAT、组播等目标，防止代理被用来访问容器所在的内部网络（`ALLOW_PRIVATE_DESTINATIONS=true` 可放开） |
-| **接入点容灾** | 握手超时会自动轮换 Cloudflare 接入点（多 IP、2408/500/1701/4500 等端口）；持续不可用时退出，由 Docker 重启 |
+| **接入点容灾** | 握手超时或探测失败时原地轮换 Cloudflare 接入点（多 IP、2408/500/1701/4500 等端口）并立即重新握手，进程不重启；轮换后仍持续不可用才退出，由 Docker 重启 |
 | **WARP+ 密钥支持** | 通过环境变量 `WARP_LICENSE_KEY` 绑定许可密钥，切换为 WARP+ 出口 |
 | **多架构原生镜像** | 静态 Go 二进制 + distroless 基础镜像，原生支持 `linux/amd64` 与 `linux/arm64` |
 | **双模式健康监控** | 独立 HTTP 端口（默认 `8080`）提供 `/healthz` 探活与 `/status` 运行指标（隧道握手、流量、trace），并自带命令行健康检查探针 |

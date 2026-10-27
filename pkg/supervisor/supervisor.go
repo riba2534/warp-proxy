@@ -245,6 +245,13 @@ func (s *Supervisor) waitReady(ctx context.Context) (*health.Result, error) {
 	}
 }
 
+// sinceSwitch 返回距建隧道或最近一次切换接入点的时间
+func (s *Supervisor) sinceSwitch() time.Duration {
+	s.tunMu.Lock()
+	defer s.tunMu.Unlock()
+	return time.Since(s.lastSwitch)
+}
+
 // handshakeSinceSwitch 报告当前接入点在建隧道或最近一次切换之后是否完成过握手
 func (s *Supervisor) handshakeSinceSwitch() bool {
 	s.tunMu.Lock()
@@ -258,7 +265,7 @@ func (s *Supervisor) handshakeSinceSwitch() bool {
 }
 
 // rotate 切换到下一个接入点；刚建好或刚切换的接入点先等 grace。报告是否发起了切换。
-// 切换是原地进行的，隧道地址不变，新接入点可用时已有的连接不受影响。
+// 切换在原地进行，进程与隧道地址不变；换到另一台 Cloudflare 边缘后，已有连接通常会被重置。
 func (s *Supervisor) rotate(reason string) bool {
 	s.tunMu.Lock()
 	t, since := s.tun, time.Since(s.lastSwitch)
@@ -285,7 +292,8 @@ func (s *Supervisor) rotate(reason string) bool {
 // monitorHealth probes every RECOVERY_INTERVAL. From the second consecutive
 // failure on it rotates the endpoint in place. With RECOVERY_FAILURES > 0 it
 // exits after that many consecutive failures, but only once a rotation has been
-// tried, so Docker restarts the container; 0 keeps probing and rotating forever.
+// tried and the new endpoint had its grace period, so Docker restarts the
+// container; 0 keeps probing and rotating forever.
 func (s *Supervisor) monitorHealth() {
 	timer := time.NewTimer(s.cfg.RecoveryGrace)
 	defer timer.Stop()
@@ -313,7 +321,7 @@ func (s *Supervisor) monitorHealth() {
 			}
 			failures++
 			slog.Warn("WARP health probe failed", "consecutive", failures, "error", res.Error)
-			if exitAfter > 0 && failures >= exitAfter && rotated {
+			if exitAfter > 0 && failures >= exitAfter && rotated && s.sinceSwitch() >= s.grace {
 				s.fail(fmt.Errorf("WARP unavailable for %d consecutive probes", failures))
 				return
 			}
