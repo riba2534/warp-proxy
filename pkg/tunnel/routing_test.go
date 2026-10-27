@@ -3,12 +3,15 @@
 package tunnel
 
 import (
+	"errors"
 	"math"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 func TestRoutingRules(t *testing.T) {
@@ -89,5 +92,85 @@ func TestOwnRule(t *testing.T) {
 	otherTable.Table = 51820
 	if ownRule(untagged, 22337) || ownRule(otherTable, 22337) {
 		t.Fatal("a rule must carry our tag and our table to be ours")
+	}
+}
+
+func TestAddressConflict(t *testing.T) {
+	want := []netip.Prefix{netip.MustParsePrefix("172.16.0.2/32"), netip.MustParsePrefix("2606:4700:110::2/128")}
+	addr := func(s string, link int) netlink.Addr {
+		a, err := netlink.ParseAddr(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.LinkIndex = link
+		return *a
+	}
+	free := []netlink.Addr{addr("127.0.0.1/8", 1), addr("10.0.0.2/24", 2), addr("172.16.0.3/32", 3), addr("::1/128", 1)}
+	if a, ok := addressConflict(free, want); ok {
+		t.Fatalf("unexpected conflict with %v", a)
+	}
+	// A host's own WARP tunnel holds the same address, whatever its prefix length.
+	for _, taken := range []netlink.Addr{addr("172.16.0.2/32", 9), addr("172.16.0.2/12", 9), addr("2606:4700:110::2/64", 9)} {
+		a, ok := addressConflict(append(free, taken), want)
+		if !ok || a.LinkIndex != 9 {
+			t.Fatalf("conflict with %v not found", taken)
+		}
+	}
+}
+
+func TestIPv6Confinement(t *testing.T) {
+	cases := []struct {
+		stack, policyRouting, disabled bool
+		confine, fails                 bool
+	}{
+		{stack: false, confine: false},                                    // no IPv6 at all: nothing can leak
+		{stack: true, policyRouting: true, confine: true},                 // the normal case
+		{stack: true, policyRouting: true, disabled: true, confine: true}, // still confined, cheaply
+		{stack: true, policyRouting: false, disabled: true, confine: false},
+		{stack: true, policyRouting: false, disabled: false, fails: true}, // would leak: refuse
+	}
+	for _, tc := range cases {
+		confine, err := ipv6Confinement(tc.stack, tc.policyRouting, tc.disabled)
+		if confine != tc.confine || (err != nil) != tc.fails {
+			t.Fatalf("%+v: got %v %v", tc, confine, err)
+		}
+		if err != nil && !strings.Contains(err.Error(), "net.ipv6.conf.all.disable_ipv6=1") {
+			t.Fatalf("error does not tell the operator what to do: %v", err)
+		}
+	}
+}
+
+func TestOwnLink(t *testing.T) {
+	ours, other := testKey(t), testKey(t)
+	link := func(kind, alias string) netlink.Link {
+		attrs := netlink.LinkAttrs{Name: "warp0", Alias: alias}
+		if kind == "wireguard" {
+			return &netlink.Wireguard{LinkAttrs: attrs}
+		}
+		return &netlink.Tuntap{LinkAttrs: attrs}
+	}
+	key := func(k wgtypes.Key) func(string) (wgtypes.Key, error) {
+		return func(string) (wgtypes.Key, error) { return k, nil }
+	}
+	noDevice := func(string) (wgtypes.Key, error) { return wgtypes.Key{}, errors.New("no such device") }
+	cases := []struct {
+		name      string
+		link      netlink.Link
+		deviceKey func(string) (wgtypes.Key, error)
+		own       bool
+	}{
+		{"tagged tun", link("tuntap", linkAlias), noDevice, true},
+		{"tagged wireguard", link("wireguard", linkAlias), key(other), true},
+		{"untagged wireguard with our key", link("wireguard", ""), key(ours), true},
+		{"untagged wireguard with another key", link("wireguard", ""), key(other), false},
+		{"untagged wireguard without a key", link("wireguard", ""), key(wgtypes.Key{}), false},
+		{"untagged wireguard, unreadable", link("wireguard", ""), noDevice, false},
+		{"untagged tun", link("tuntap", ""), key(ours), false},
+		{"other alias", link("wireguard", "wg-quick"), key(other), false},
+	}
+	for _, tc := range cases {
+		if got := ownLink(tc.link, ours, tc.deviceKey); got != tc.own {
+			t.Fatalf("%s: got %v", tc.name, got)
+		}
 	}
 }
