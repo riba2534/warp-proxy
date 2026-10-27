@@ -569,28 +569,61 @@ func TestLoadAppliesLicense(t *testing.T) {
 	t.Run("rejected license", func(t *testing.T) {
 		f := newFakeAPI(t, map[string]http.HandlerFunc{
 			"PUT " + accountPath: cfError(403, "license "+newLicense+" rejected for token "+testToken),
+			"GET " + devicePath:  reply(200, devicePayload("", "free", "172.16.0.9", "", "")),
 		})
 		opts := f.options(filepath.Join(t.TempDir(), "reg.json"))
 		st := seed(t, opts.Path)
-		before := readFile(t, opts.Path)
 		opts.LicenseKey = newLicense
 
-		_, err := Load(context.Background(), opts)
-		if err == nil {
-			t.Fatal("Load ignored a rejected license")
+		p, err := Load(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("Load failed on a rejected license: %v", err)
 		}
-		if !strings.Contains(err.Error(), "403") || !strings.Contains(err.Error(), "rejected") {
-			t.Errorf("error = %v, want the status and Cloudflare's message", err)
+		equalCalls(t, f.take(), "PUT "+accountPath, "GET "+devicePath)
+		if p.AccountType != "free" || p.AddressV4 != netip.MustParsePrefix("172.16.0.9/32") {
+			t.Errorf("profile = %+v, want the refreshed free account", p)
 		}
-		assertNoSecrets(t, "error", err.Error(), newLicense, testToken, st.PrivateKey)
-		if !bytes.Equal(readFile(t, opts.Path), before) {
-			t.Error("registration file changed after a rejected license")
+		logs := f.logs.String()
+		if !strings.Contains(logs, "level=ERROR") || !strings.Contains(logs, "device_id="+testDeviceID) || !strings.Contains(logs, "403") {
+			t.Errorf("logs lack an ERROR with the device and API error:\n%s", logs)
+		}
+		assertNoSecrets(t, "log", logs, newLicense, testToken, st.PrivateKey)
+		if saved, _ := readState(opts.Path); saved == nil || saved.License != testLicense {
+			t.Errorf("saved state = %+v, want the old license kept", saved)
+		}
+
+		// The next start tries the license again.
+		if _, err := Load(context.Background(), opts); err != nil {
+			t.Fatal(err)
+		}
+		equalCalls(t, f.take(), "PUT "+accountPath, "GET "+devicePath)
+	})
+
+	t.Run("license failure keeps the cached profile", func(t *testing.T) {
+		f := newFakeAPI(t, map[string]http.HandlerFunc{
+			"PUT " + accountPath: cfError(503, "maintenance"),
+			"GET " + devicePath:  cfError(503, "maintenance"),
+		})
+		opts := f.options(filepath.Join(t.TempDir(), "reg.json"))
+		st := seed(t, opts.Path)
+		want, _ := st.profile()
+		infoBefore, _ := os.Stat(opts.Path)
+		opts.LicenseKey = newLicense
+
+		p, err := Load(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("Load failed on a license error: %v", err)
+		}
+		if !reflect.DeepEqual(p, want) {
+			t.Errorf("profile = %+v, want cached %+v", p, want)
+		}
+		infoAfter, _ := os.Stat(opts.Path)
+		if saved, _ := readState(opts.Path); !os.SameFile(infoBefore, infoAfter) || saved == nil || saved.License != testLicense {
+			t.Errorf("registration file rewritten or license changed: %+v", saved)
 		}
 	})
 
-	t.Run("license kept after registration failure", func(t *testing.T) {
-		// The device is persisted before the license is applied, so a failed
-		// license never leads to a second registration.
+	t.Run("fresh registration with a rejected license", func(t *testing.T) {
 		f := newFakeAPI(t, map[string]http.HandlerFunc{
 			"POST " + regPath:    reply(200, devicePayload(testToken, "free", "172.16.0.2", "", "")),
 			"PATCH " + namePath:  reply(200, []any{}),
@@ -598,12 +631,16 @@ func TestLoadAppliesLicense(t *testing.T) {
 		})
 		opts := f.options(filepath.Join(t.TempDir(), "reg.json"))
 		opts.LicenseKey = newLicense
-		if _, err := Load(context.Background(), opts); err == nil {
-			t.Fatal("Load ignored a rejected license")
+		p, err := Load(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("Load failed on a rejected license: %v", err)
 		}
-		saved, err := readState(opts.Path)
-		if err != nil || saved.DeviceID != testDeviceID || saved.License != testLicense {
-			t.Errorf("saved state = %+v, %v; want the registered device", saved, err)
+		equalCalls(t, f.take(), "POST "+regPath, "PATCH "+namePath, "PUT "+accountPath)
+		if p.DeviceID != testDeviceID || p.AccountType != "free" {
+			t.Errorf("profile = %+v, want the registered free device", p)
+		}
+		if saved, _ := readState(opts.Path); saved == nil || saved.License != testLicense {
+			t.Errorf("saved state = %+v, want the registration's license", saved)
 		}
 	})
 }

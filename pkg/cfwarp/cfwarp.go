@@ -105,11 +105,14 @@ func Load(ctx context.Context, opts Options) (*Profile, error) {
 	if o.LicenseKey != "" && o.LicenseKey != st.License {
 		path := "/reg/" + st.DeviceID + "/account"
 		if err := c.call(ctx, http.MethodPut, path, st.AccessToken, map[string]string{"license": o.LicenseKey}, nil); err != nil {
-			return nil, fmt.Errorf("cfwarp: apply WARP+ license: %w", err)
+			// An invalid, expired or exhausted license must not stop the proxy:
+			// keep the current account and retry on the next start.
+			o.Logger.Error("applying WARP+ license failed, continuing with the current account", "device_id", st.DeviceID, "error", err)
+		} else {
+			o.Logger.Info("applied WARP+ license", "device_id", st.DeviceID)
+			// The account type changes with the license; unknown until refreshed.
+			st.License, st.AccountType, refresh = o.LicenseKey, "", true
 		}
-		o.Logger.Info("applied WARP+ license", "device_id", st.DeviceID)
-		// The account type changes with the license; unknown until refreshed.
-		st.License, st.AccountType, refresh = o.LicenseKey, "", true
 	}
 	if refresh {
 		if err := c.refresh(ctx, st); err != nil {
