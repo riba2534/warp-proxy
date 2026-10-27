@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPickEndpointOrderAndWrap(t *testing.T) {
@@ -57,16 +58,32 @@ func TestPickEndpointNoneResolve(t *testing.T) {
 	}
 }
 
-func TestPickEndpointStopsOnCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	calls := 0
-	resolve := func(context.Context, string) (netip.AddrPort, error) {
-		calls++
-		cancel()
-		return netip.AddrPort{}, context.Canceled
+func TestEndpointResolutionIsBounded(t *testing.T) {
+	oldTimeout, oldBudget := resolveTimeout, resolveBudget
+	resolveTimeout, resolveBudget = 50*time.Millisecond, 120*time.Millisecond
+	t.Cleanup(func() { resolveTimeout, resolveBudget = oldTimeout, oldBudget })
+
+	lookups := 0
+	r := resolver{
+		lookup: func(ctx context.Context, host string) ([]netip.Addr, error) {
+			lookups++
+			if _, ok := ctx.Deadline(); !ok {
+				t.Errorf("lookup of %s has no deadline", host)
+			}
+			<-ctx.Done() // a resolver that never answers
+			return nil, ctx.Err()
+		},
+		ipv6: func(netip.Addr) bool { return false },
 	}
-	if _, _, err := pickEndpoint(ctx, []string{"a:1", "b:2", "c:3"}, 0, resolve); err == nil || calls != 1 {
-		t.Fatalf("got %v after %d calls", err, calls)
+	candidates := []string{"a.example:1", "b.example:1", "c.example:1", "d.example:1", "162.159.192.1:2408"}
+	start := time.Now()
+	idx, ap, err := pickEndpoint(context.Background(), candidates, 0, r.resolve)
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("resolution took %v", elapsed)
+	}
+	// The budget runs out during the third lookup; the IP literal is still used.
+	if err != nil || idx != 4 || ap.String() != "162.159.192.1:2408" || lookups != 4 {
+		t.Fatalf("got %d %v %v after %d lookups", idx, ap, err, lookups)
 	}
 }
 

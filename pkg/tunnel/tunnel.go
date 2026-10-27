@@ -1,7 +1,8 @@
 // Package tunnel brings up a WireGuard interface inside the current network
-// namespace and routes all egress through it the way wg-quick does, except
-// WireGuard's own UDP and the directly connected subnets. It works on Linux
-// only; elsewhere Up returns an error wrapping errors.ErrUnsupported.
+// namespace and routes sockets carrying Config.Mark, and packets from the
+// tunnel addresses, through it; everything else keeps the main table. It
+// works on Linux only; elsewhere Up returns an error wrapping
+// errors.ErrUnsupported.
 package tunnel
 
 import "time"

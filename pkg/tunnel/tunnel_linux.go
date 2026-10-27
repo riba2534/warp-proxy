@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/netip"
 	"sync"
@@ -19,11 +20,13 @@ type Tunnel struct {
 	cfg      Config
 	log      *slog.Logger
 	resolver resolver
+	lock     io.Closer
 
 	// Set by Up, read-only afterwards.
 	mode      Mode
 	ipv6      bool
 	linkIndex int
+	routes    []netlink.Route
 	rules     []netlink.Rule
 
 	rotateMu sync.Mutex // serialises RotateEndpoint
@@ -42,33 +45,36 @@ func Up(ctx context.Context, cfg Config) (_ *Tunnel, err error) {
 		return nil, err
 	}
 	private, peer, _ := cfg.keys()
+	lock, err := lockNetns()
+	if err != nil {
+		return nil, err
+	}
 	t := &Tunnel{
 		cfg:      cfg,
 		log:      cfg.Logger.With("interface", cfg.Interface),
-		resolver: newResolver(cfg.FwMark),
+		resolver: newResolver(),
+		lock:     lock,
 	}
-	if err := removeStaleLink(cfg.Interface, t.log); err != nil {
-		return nil, err
-	}
-	if err := removeStaleRules(cfg.Table, cfg.FwMark, t.log); err != nil {
-		return nil, err
-	}
-	if t.current, t.endpoint, err = pickEndpoint(ctx, cfg.Endpoints, 0, t.resolver.resolve); err != nil {
-		return nil, err
-	}
-
 	defer func() {
 		if err != nil {
 			_ = t.Close()
 		}
 	}()
+	if err := removeStaleLink(cfg.Interface, t.log); err != nil {
+		return nil, err
+	}
+	if err := removeStaleRules(cfg.Table, t.log); err != nil {
+		return nil, err
+	}
+	if t.current, t.endpoint, err = pickEndpoint(ctx, cfg.Endpoints, 0, t.resolver.resolve); err != nil {
+		return nil, err
+	}
 	t.dev, t.mode, err = createDevice(cfg.Mode, deviceParams{
 		name:      cfg.Interface,
 		mtu:       cfg.MTU,
 		private:   private,
 		peer:      peer,
 		endpoint:  t.endpoint,
-		mark:      cfg.FwMark,
 		keepalive: cfg.PersistentKeepalive,
 	}, t.log)
 	if err != nil {
@@ -79,6 +85,11 @@ func Up(ctx context.Context, cfg Config) (_ *Tunnel, err error) {
 		return nil, fmt.Errorf("look up interface %s: %w", cfg.Interface, err)
 	}
 	t.linkIndex = link.Attrs().Index
+	// Kernel links already carry the alias from creation; a TUN cannot, but
+	// it disappears with this process anyway.
+	if err := netlink.LinkSetAlias(link, linkAlias); err != nil {
+		return nil, fmt.Errorf("tag interface %s: %w", cfg.Interface, err)
+	}
 	if err := t.addAddresses(link); err != nil {
 		return nil, err
 	}
@@ -88,7 +99,6 @@ func Up(ctx context.Context, cfg Config) (_ *Tunnel, err error) {
 	if err := t.addRouting(); err != nil {
 		return nil, err
 	}
-	enableSrcValidMark(t.log)
 	if err := t.dev.start(); err != nil {
 		return nil, fmt.Errorf("start WireGuard device: %w", err)
 	}
@@ -126,30 +136,32 @@ func (t *Tunnel) addAddresses(link netlink.Link) error {
 	return nil
 }
 
-// addRouting routes IPv4 through the tunnel and, when it is configured, IPv6.
-// IPv6 is optional: if its routing fails the tunnel carries IPv4 only.
+// addRouting sends marked IPv4 through the tunnel, and marked IPv6 through the
+// tunnel or, when the tunnel has no IPv6, into the unreachable route. Without
+// an IPv6 stack there is no IPv6 traffic to confine.
 func (t *Tunnel) addRouting() error {
-	if err := t.routeFamily(netlink.FAMILY_V4); err != nil {
+	if err := t.routeFamily(netlink.FAMILY_V4, true); err != nil {
 		return err
 	}
-	if t.ipv6 {
-		if err := t.routeFamily(netlink.FAMILY_V6); err != nil {
-			t.log.Warn("cannot route IPv6 through the tunnel, tunnel carries IPv4 only", "error", err)
-			t.ipv6 = false
-		}
+	if !ipv6Stack() {
+		return nil
 	}
-	return nil
+	return t.routeFamily(netlink.FAMILY_V6, t.ipv6)
 }
 
-// routeFamily installs the table's default route before the rules that send
-// traffic to it, and the suppress rule before the tunnel rule. Routes need no
-// bookkeeping: deleting the link removes them.
-func (t *Tunnel) routeFamily(family int) error {
-	route := defaultRoute(family, t.linkIndex, t.cfg.Table)
-	if err := netlink.RouteReplace(&route); err != nil {
-		return fmt.Errorf("add default route to table %d: %w", t.cfg.Table, err)
+// routeFamily fills the tunnel table before adding the rules that use it.
+func (t *Tunnel) routeFamily(family int, viaTunnel bool) error {
+	for _, route := range tableRoutes(family, t.cfg.Table, t.linkIndex, viaTunnel) {
+		if err := netlink.RouteReplace(&route); err != nil {
+			return fmt.Errorf("add route %v: %w", route, err)
+		}
+		t.routes = append(t.routes, route)
 	}
-	for _, rule := range routingRules(family, t.cfg.Table, t.cfg.FwMark) {
+	var addrs []netip.Prefix // tunnel addresses of this family, when assigned
+	if viaTunnel {
+		addrs = t.cfg.Addresses
+	}
+	for _, rule := range routingRules(family, t.cfg.Table, t.cfg.Mark, addrs) {
 		if err := netlink.RuleAdd(&rule); err != nil {
 			return fmt.Errorf("add routing rule %v: %w", rule, err)
 		}
@@ -209,8 +221,9 @@ func (t *Tunnel) RotateEndpoint() (string, error) {
 	return ep.String(), nil
 }
 
-// Close removes the rules and the link (with its routes) Up created. It is
-// idempotent.
+// Close removes the rules, routes and link Up created. It is idempotent.
+// Marked sockets still open afterwards use the main table, so the proxy must
+// be stopped first.
 func (t *Tunnel) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -219,10 +232,14 @@ func (t *Tunnel) Close() error {
 	}
 	t.closed = true
 	var errs []error
-	// Reverse order: the tunnel rule goes before the suppress rule.
-	for i := len(t.rules) - 1; i >= 0; i-- {
+	for i := range t.rules {
 		if err := netlink.RuleDel(&t.rules[i]); err != nil && !notExist(err) {
 			errs = append(errs, fmt.Errorf("delete rule %v: %w", t.rules[i], err))
+		}
+	}
+	for i := range t.routes {
+		if err := netlink.RouteDel(&t.routes[i]); err != nil && !notExist(err) {
+			errs = append(errs, fmt.Errorf("delete route %v: %w", t.routes[i], err))
 		}
 	}
 	if t.dev != nil {
@@ -239,6 +256,11 @@ func (t *Tunnel) Close() error {
 			errs = append(errs, fmt.Errorf("delete interface %s: %w", t.cfg.Interface, err))
 		}
 	}
-	t.log.Info("WireGuard tunnel closed")
+	if t.dev != nil {
+		t.log.Info("WireGuard tunnel closed")
+	}
+	if err := t.lock.Close(); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
 }
